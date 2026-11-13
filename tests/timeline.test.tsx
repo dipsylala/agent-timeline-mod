@@ -50,6 +50,8 @@ test("a subagent's row, its calls, its result and a hook block, on every surface
     const row = await ui.find({ key: 'a1' })
     expect(row?.text).toMatch(/Survey repo/)
     expect(row?.text).toMatch(/Done · .* · 2 calls · 1 blocked/)
+    // The block's diamond sits on the chart as a Button of its own.
+    expect((await ui.find({ key: 'mark-0' }))?.text).toBe('◆')
     await ui.unmount()
   }
 
@@ -59,6 +61,28 @@ test("a subagent's row, its calls, its result and a hook block, on every surface
   expect((await ui.find({ type: 'Text', text: /Write \/x.txt/ }))?.text).toMatch(/^✗/)
   expect(await ui.find({ type: 'Text', text: /PreToolUse hook blocked .*no writes here/ })).toBeDefined()
   expect(await ui.find({ key: 'view-a1' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('clicking a diamond opens its row at the call the hook fired on', async ($, on) => {
+  mock.clock(on, { now: 1_700_000_000_000 })
+  on('command.register', () => ({ value: { command: 'timeline' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('agent.list', () => ({ value: [{ id: 'a1', description: 'Survey repo', type: 'Explore', status: 'running' }] }))
+  on('tool.call', () => ({ result: {} }))
+  on('classic.PreToolUse', (_, e) => (e.tool === 'Write' ? { deny: 'no writes here' } : {}))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.tool.call({ tool: 'Write', file_path: '/x.txt', content: 'y', agentId: 'a1', tool_use_id: 't2' })
+  // Enough later calls that the blocked one is no longer among the latest shown.
+  for (let i = 0; i < 10; i++) await $.tool.call({ tool: 'Bash', command: `echo ${i}`, agentId: 'a1', tool_use_id: `b${i}` })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /Write \/x.txt/ })).toBeUndefined()
+  await ui.press({ key: 'mark-0' })
+  expect((await ui.find({ type: 'Text', text: /Write \/x.txt/ }))?.text).toMatch(/^→ ✗ .* Write \/x.txt/)
+  expect((await ui.find({ type: 'Text', text: /PreToolUse hook blocked/ }))?.text).toMatch(/^→ ◆/)
   await ui.unmount()
 })
 

@@ -47,6 +47,8 @@ declare module 'claude-code' {
       timeline: Shaped<Timeline>
       now: number
       expanded: string[]
+      /** The `at` of the hook marker last clicked; 0 for none. */
+      focused: number
     }
   }
 }
