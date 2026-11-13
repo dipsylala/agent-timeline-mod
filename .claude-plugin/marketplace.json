@@ -1,0 +1,5 @@
+{
+  "name": "agent-timeline-mod",
+  "owner": { "name": "dipsylala" },
+  "plugins": [{ "name": "agent-timeline", "source": "./" }]
+}
