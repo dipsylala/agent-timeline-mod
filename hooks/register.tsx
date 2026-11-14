@@ -685,11 +685,21 @@ export const register: Register = on => {
             const marks = marksOf(agent)
             return (
               <Box key={`agent-${agent.id}`} flexDirection="row" gap={1}>
-                <Box width={labelColumns} flexDirection="row" gap={1}>
+                <Box key={`label-${agent.id}`} width={labelColumns} flexDirection="row" gap={1}>
                   <Text color={STATUS_THEME[status]}>●</Text>
                   <Button key={agent.id} plain onPress={() => choose(agent.id)}>
                     <Text bold={agent.id === chosen}>{shortLabel(agent.description)}</Text>
                   </Button>
+                  {/* A cut name shows whole on hover, over the name itself; the card has its
+                      own Button, as it covers the name's. inverseText is the theme's background
+                      colour, so the card hides what is under it. */}
+                  {shortLabel(agent.description) !== agent.description && (
+                    <Box position="absolute" top={0} left={2} display="none" hover={{ display: 'flex' }} backgroundColor="inverseText">
+                      <Button key={`${agent.id}-full`} plain onPress={() => choose(agent.id)}>
+                        <Text bold={agent.id === chosen}>{agent.description}</Text>
+                      </Button>
+                    </Box>
+                  )}
                 </Box>
                 {Svg ? (
                   <Box width={trackColumns}>

@@ -301,9 +301,20 @@ test('a session like a long resumed one renders', async ($, on) => {
   const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 90 }, surface: 'desktop' })
   expect((await ui.find({ type: 'Text', text: /^14 agents$/ }))?.text).toBe('14 agents')
   expect(await ui.find({ key: 'ag13' })).toBeDefined()
-  await ui.press({ key: 'ag0' })
+  // A cut name keeps its whole text for the hover card.
+  expect((await ui.find({ key: 'ag13' }))?.text).toMatch(/…$/)
+  expect((await ui.find({ key: 'ag13-full' }))?.text).toBe('Stage 13 correctness review with a long name')
+  // The hover card's own button opens the card as the cut name does.
+  await ui.press({ key: 'ag0-full' })
   expect(await ui.find({ type: 'Text', text: /PostToolUse blocked Contents of/ })).toBeDefined()
   await ui.unmount()
+
+  // The hover card for cut names is drawn on every surface.
+  for (const surface of ['terminal', 'vscode', 'mobile'] as const) {
+    const other = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 90 }, surface })
+    expect(await other.find({ type: 'Text', text: /^Stage 13 correctness review with a long name$/ }), surface).toBeDefined()
+    await other.unmount()
+  }
 })
 
 test('a refused command name does not stop the session start', async ($, on) => {
