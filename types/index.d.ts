@@ -48,8 +48,8 @@ declare module 'claude-code' {
       now: number
       /** The agent whose details show below the list; '' for none. */
       selected: string
-      /** Fit the chart to the subagents' activity, or show the whole session. */
-      zoom: 'agents' | 'session'
+      /** The chart's window: the subagents' activity, the whole session, or the last 30 minutes. */
+      zoom: 'agents' | 'session' | 'recent'
     }
   }
 }

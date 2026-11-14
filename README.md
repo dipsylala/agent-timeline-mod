@@ -25,7 +25,7 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 ## What the pane shows
 
 - A summary line (agents, and how many are running, done, stalled…) and a **Needs attention** line naming stalled agents and agents a hook blocked in the last 15 minutes with no clean tool call since.
-- One row per agent, main session first: a status dot (Running, Quiet, Stalled, Done, Failed, Stopped by colour), its name, its busy bars on a shared time axis, and its active time. The axis fits the subagents' activity by default; **Show whole session** widens it to the session's start.
+- One row per agent, main session first: a status dot (Running, Quiet, Stalled, Done, Failed, Stopped by colour), its name, its busy bars on a shared time axis, and its active time. Three views set the time axis: **Agents** (the default) fits the subagents' activity, **Whole session** runs from the session's start, and **Last 30 min** shows the last half hour.
 - Hook markers on the bars: a red stripe for a block, purple for a hook message. Hover a bar or a stripe for details. The terminal, which draws no SVG, shows the same tracks in text cells, accurate to about one cell.
 - Clicking a name shows that agent's card below the list, one agent at a time (another name switches, the same name closes it): its status, type, start time and counts, its latest tool calls (a call a hook blocked stays listed even once older calls scroll off), hook events and result, and, in the terminal, **Open transcript** to switch the main view to that agent (the desktop app has no main view a mod can switch).
 
@@ -33,7 +33,7 @@ The pane opens when a session starts; `/timeline` reopens it.
 
 ## Limits
 
-- Agents from before the mod loaded, or from a resumed session, are rebuilt from the session's transcripts under `~/.claude/projects` when the session starts. A transcript over 4 MiB (the most a mod can read at once) is skipped: in long sessions that is usually the main session's, so its row starts when the mod loaded, while subagents still come in. The transcript format is not a documented Claude Code interface, so an update can break this part.
+- Agents from before the mod loaded, or from a resumed session, are rebuilt from the session's transcripts under `~/.claude/projects` when the session starts. A transcript over 4 MiB (the most a mod can read at once) is skipped: in long sessions that is usually the main session's. Its row then shows as busy the moments it launched each subagent and each handed back, and has no tool calls from before the mod loaded; subagents still come in whole. The transcript format is not a documented Claude Code interface, so an update can break this part.
 - No batch grouping, no file or diff viewer, no session list, no token counts (the skill has these).
 - Settings hooks that fail without blocking are not visible to it.
 - Mod hooks are an early-access Claude Code API and may change between releases.

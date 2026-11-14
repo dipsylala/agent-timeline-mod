@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, ThemeKey } from 'claude-code'
 
 import type { Agent, Call, HookMark, Timeline } from '../types'
-import { brief, IDLE_GAP, KEEP_CALLS, mergeAgent, newHooks, parseTranscript } from './transcript'
+import { brief, IDLE_GAP, KEEP_CALLS, mergeAgent, mergeSpans, newHooks, parseTranscript } from './transcript'
 
 const PANE = 'agent-timeline'
 const TITLE = 'Agent timeline'
@@ -25,8 +25,9 @@ const timeline = atom({ plugin: 'agent-timeline', key: 'timeline' } as const, EM
 const now = atom({ plugin: 'agent-timeline', key: 'now' } as const, 0)
 // The agent whose details show below the list; '' for none.
 const selected = atom({ plugin: 'agent-timeline', key: 'selected' } as const, '')
-// Fit the chart to the subagents' activity, or show the whole session.
-const zoom = atom({ plugin: 'agent-timeline', key: 'zoom' } as const, 'agents' as 'agents' | 'session')
+// The chart's window: the subagents' activity, the whole session, or the last 30 minutes.
+const zoom = atom({ plugin: 'agent-timeline', key: 'zoom' } as const, 'agents' as 'agents' | 'session' | 'recent')
+const RECENT = 30 * 60_000 // the "Last 30 min" view
 
 function newAgent(id: string, t: number, description: string, type: string, parentId?: string): Agent {
   const agent: Agent = { id, description, type, parentId, startedAt: t, lastAt: t, lastCleanAt: 0, spans: [[t, t]], calls: [], callCount: 0 }
@@ -339,6 +340,28 @@ async function backfill($: EngineInterface, cwd: string) {
     const parsed = parseTranscript(text, base, { finished: meta.finished })
     if (parsed) found.push({ ...parsed, isMain: false })
   }
+  if (!main && found.length > 0) {
+    // The main transcript is too large to read. The main session was busy when
+    // it launched each subagent and when each handed back, so those moments
+    // stand in for its own activity.
+    const moments = found.flatMap(({ agent }) => [agent.startedAt, agent.lastAt])
+    const spans = mergeSpans(moments.map((at): [number, number] => [at, at]))
+    found.push({
+      agent: {
+        id: MAIN,
+        description: 'Main session',
+        type: 'main',
+        startedAt: Math.min(...moments),
+        lastAt: Math.max(...moments),
+        lastCleanAt: 0,
+        spans,
+        calls: [],
+        callCount: 0,
+      },
+      hooks: [],
+      isMain: true,
+    })
+  }
   if (found.length === 0) return
   await update($, timeline, tl => {
     let agents = tl.agents
@@ -465,7 +488,7 @@ export const register: Register = on => {
     const Svg = e.surface !== 'terminal' && 'Svg' in ui ? ui.Svg : undefined
     const { agents: all, hooks } = await read($, timeline)
     const chosen = await read($, selected)
-    const fitAgents = (await read($, zoom)) === 'agents'
+    const view = await read($, zoom)
     const t = Math.max(await read($, now), await $.clock.now())
 
     if (all.length === 0) return <Text dimColor>No activity yet.</Text>
@@ -478,14 +501,22 @@ export const register: Register = on => {
     const shown = [...main, ...rest.filter(a => unfinished.includes(a) || finished.includes(a))]
     const hidden = all.length - shown.length
 
-    // The window: the subagents' own activity with a margin, or the whole session.
+    // The window: the last 30 minutes, the subagents' own activity with a
+    // margin, or the whole session. Agents falls back to the whole session
+    // while there are no subagents.
     const subs = shown.filter(a => a.id !== MAIN)
-    const isFitted = fitAgents && subs.length > 0
-    const first = Math.min(...(isFitted ? subs : shown).map(a => a.startedAt))
+    const isFitted = view === 'agents' && subs.length > 0
+    const first = view === 'recent' ? t - RECENT : Math.min(...(isFitted ? subs : shown).map(a => a.startedAt))
     const last = isFitted && subs.every(a => a.endedAt !== undefined) ? Math.max(...subs.map(a => a.lastAt)) : t
     const margin = isFitted ? Math.max((last - first) * 0.05, 1000) : 0
     const t0 = first - margin
     const t1 = Math.min(t, last + margin)
+    const views = [
+      { id: 'session', label: 'Whole session' },
+      ...(subs.length > 0 ? [{ id: 'agents', label: 'Agents' }] : []),
+      { id: 'recent', label: 'Last 30 min' },
+    ] as const
+    const current = view === 'agents' && !isFitted ? 'session' : view
 
     const counts = new Map<Status, number>()
     for (const agent of rest) counts.set(statusOf(agent, t), (counts.get(statusOf(agent, t)) ?? 0) + 1)
@@ -607,11 +638,13 @@ export const register: Register = on => {
             </Text>
           ))}
           <Box flexGrow={1} />
-          {subs.length > 0 && (
-            <Button key="zoom" plain onPress={() => update($, zoom, z => (z === 'agents' ? 'session' : 'agents'))}>
-              <Text dimColor>{fitAgents ? 'Show whole session' : 'Fit to agents'}</Text>
+          {views.map(option => (
+            <Button key={`view-${option.id}`} plain onPress={() => update($, zoom, () => option.id)}>
+              <Text bold={option.id === current} dimColor={option.id !== current}>
+                {option.label}
+              </Text>
             </Button>
-          )}
+          ))}
         </Box>
         {attention.length > 0 && <Text color="warning">⚠ Needs attention: {attention.join(', ')}</Text>}
 

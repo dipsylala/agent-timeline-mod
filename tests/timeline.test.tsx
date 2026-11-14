@@ -176,6 +176,16 @@ test('agents from before the mod loaded come back from the transcripts', async (
   expect((await ui.find({ type: 'Text', text: /Write \/b.ts/ }))?.text).toMatch(/^✗/)
   expect(await ui.find({ type: 'Text', text: /PreToolUse blocked writes are off/ }), 'hook').toBeDefined()
   expect(await ui.find({ type: 'Markdown', text: /All done\./ }), 'result').toBeDefined()
+
+  // The main transcript was too large, so the main row starts where the subagent did.
+  await ui.press({ key: 'main' })
+  const started = new Date(1_700_000_000_000).toTimeString().slice(0, 8)
+  expect(await ui.find({ type: 'Text', text: new RegExp(`^Main session · .* started ${started}`) }), 'main start').toBeDefined()
+
+  // Three views of the chart's window.
+  for (const key of ['view-session', 'view-agents', 'view-recent']) expect(await ui.find({ key }), key).toBeDefined()
+  await ui.press({ key: 'view-recent' })
+  expect(await ui.find({ type: 'Text', text: new RegExp(`^${new Date(1_700_000_100_010 - 30 * 60_000).toTimeString().slice(0, 5)}`) }), 'recent axis').toBeDefined()
   await ui.unmount()
 })
 
