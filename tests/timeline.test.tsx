@@ -293,9 +293,14 @@ test('a session like a long resumed one renders', async ($, on) => {
     agentId: a.id,
     toolUseId: `t${i}`,
   }))
-  // Only the timeline is seeded; the view and selection keep the engine's own store.
+  // The timeline and the tick are seeded; the selection keeps the engine's own store.
+  let tick = 0
   on('state.get', (_, e, next) =>
-    e.key === 'timeline' ? { value: { value: { shape: 'timeline-1', value: { agents: [main, ...agents], hooks } }, version: 1 } } : next(e),
+    e.key === 'timeline'
+      ? { value: { value: { shape: 'timeline-1', value: { agents: [main, ...agents], hooks } }, version: 1 } }
+      : e.key === 'now'
+        ? { value: { value: tick, version: tick + 1 } }
+        : next(e),
   )
 
   const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 90 }, surface: 'desktop' })
@@ -309,6 +314,29 @@ test('a session like a long resumed one renders', async ($, on) => {
   await clock.advance(1000) // the live clock moves on between redraws
   await ui.press({ key: 'ag1' })
   expect((await ui.find({ type: 'Svg' }))?.props.source).toBe(before)
+
+  // Ticks leave finished tracks unchanged until now passes the axis end: a
+  // three-hour window ends on a ten-minute step after the latest activity.
+  const sources = async () => (await ui.findAll({ type: 'Svg' })).map(svg => svg.props.source)
+  const end = Math.ceil((NOW - 60_000) / 600_000) * 600_000
+  const first = await sources()
+  expect(first).toHaveLength(15)
+  tick = end
+  await ui.press({ key: 'ag1' })
+  expect(await sources(), 'tick inside the step').toEqual(first)
+  expect(await ui.find({ type: 'Text', text: new Date(end).toTimeString().slice(0, 8) }), 'axis end').toBeDefined()
+  // Past it, each changed track keeps its old drawing on top of the new one
+  // while the new one loads, then the old one goes and the new one stays as it was.
+  tick = end + 1
+  await ui.press({ key: 'ag1' })
+  const stacked = await sources()
+  expect(stacked, 'old and new layers').toHaveLength(30)
+  expect(stacked[3], 'old layer on top').toBe(first[1])
+  await clock.advance(700)
+  const settled = await sources()
+  expect(settled, 'old layers gone').toHaveLength(15)
+  expect(settled[1], 'new layer kept').toBe(stacked[2])
+  expect(settled[1]).not.toBe(first[1])
 
   // The hover card's own button opens the card as the cut name does.
   await ui.press({ key: 'ag0-full' })

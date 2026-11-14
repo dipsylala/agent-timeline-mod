@@ -57,6 +57,8 @@ declare module 'claude-code' {
       now: number
       /** The agent whose details show below the list; '' for none. */
       selected: string
+      /** Bumped to redraw once a changed track has had time to load. */
+      settle: number
     }
   }
 }

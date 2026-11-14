@@ -27,6 +27,7 @@ const timeline = atom({ plugin: 'agent-timeline', key: 'timeline' } as const, EM
 const now = atom({ plugin: 'agent-timeline', key: 'now' } as const, 0)
 // The agent whose details show below the list; '' for none.
 const selected = atom({ plugin: 'agent-timeline', key: 'selected' } as const, '')
+const settle = atom({ plugin: 'agent-timeline', key: 'settle' } as const, 0)
 
 function newAgent(id: string, t: number, description: string, type: string, parentId?: string): Agent {
   const agent: Agent = { id, description, type, parentId, startedAt: t, lastAt: t, lastCleanAt: 0, spans: [[t, t]], calls: [], callCount: 0 }
@@ -251,6 +252,17 @@ const STATUS_COLOR: Record<Status, string> = {
 // so the drawing stays inside its track.
 const CELL_PX = 8.5
 
+// Desktop reloads an Svg whenever its source changes, a visible flicker. If
+// the axis ended at now, every tick and event would rescale every track, so
+// it ends at now rounded up to one of these steps, about a twentieth of the
+// window: until now passes it, only the tracks of agents still working change.
+const AXIS_STEPS = [1, 2, 5, 10, 15, 30, 60, 120, 180, 360, 720, 1440].map(minutes => minutes * 60_000)
+
+function axisEnd(t0: number, t: number): number {
+  const step = AXIS_STEPS.find(s => s >= (t - t0) / 20) ?? 1440 * 60_000
+  return Math.ceil(t / step) * step
+}
+
 function xml(text: string): string {
   return text.replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`)
 }
@@ -266,7 +278,8 @@ function xml(text: string): string {
  * height held by the Svg's own `height`.
  */
 function trackSvg(pieces: Piece[], color: string, barTip: string, width: number): string {
-  const x = (pct: number) => ((pct / 100) * width).toFixed(1)
+  // Whole units, so a change smaller than one leaves the source as it was.
+  const x = (pct: number) => Math.round((pct / 100) * width)
   const bars: { x: number; w: number }[] = []
   const stripes: string[] = []
   let pct = 0
@@ -287,9 +300,42 @@ function trackSvg(pieces: Piece[], color: string, barTip: string, width: number)
     pct += piece.pct
   }
   const rects = bars.map(
-    b => `<rect x="${x(b.x)}" y="5" width="${x(b.w)}" height="10" rx="5" fill="${color}"><title>${xml(barTip)}</title></rect>`,
+    b => `<rect x="${x(b.x)}" y="5" width="${Math.max(2, x(b.x + b.w) - x(b.x))}" height="10" rx="5" fill="${color}"><title>${xml(barTip)}</title></rect>`,
   )
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="20" viewBox="0 0 ${width} 20" preserveAspectRatio="none">${rects.join('')}${stripes.join('')}</svg>`
+}
+
+// Desktop shows nothing for an Svg while its new source loads. A changed
+// track is drawn as two layers for SETTLE_MS: the new one, loading
+// underneath, and the old one still on top. Then the old one goes. Each layer
+// is keyed by its source, so the new one is not reloaded when the old goes.
+const SETTLE_MS = 600
+type Layers = { current: string; previous?: string; changedAt: number }
+const layers = new Map<string, Layers>()
+
+function sourceKey(source: string): string {
+  let hash = 5381
+  for (let i = 0; i < source.length; i++) hash = ((hash * 33) ^ source.charCodeAt(i)) >>> 0
+  return hash.toString(36)
+}
+
+/** The sources to draw for one track, bottom first, and whether a layer is waiting to go. */
+function layered(id: string, source: string, at: number): { sources: string[]; isSettling: boolean } {
+  const known = layers.get(id)
+  if (!known) {
+    layers.set(id, { current: source, changedAt: at })
+    return { sources: [source], isSettling: false }
+  }
+  if (known.current !== source) {
+    known.previous = known.current
+    known.current = source
+    known.changedAt = at
+  } else if (known.previous !== undefined && at - known.changedAt >= SETTLE_MS) {
+    known.previous = undefined
+  }
+  return known.previous === undefined
+    ? { sources: [known.current], isSettling: false }
+    : { sources: [known.current, known.previous], isSettling: true }
 }
 
 /** This session's transcript folder: `<id>.jsonl` beside it, `subagents/` inside it. */
@@ -535,6 +581,9 @@ export const register: Register = on => {
     const Svg = e.surface !== 'terminal' && 'Svg' in ui ? ui.Svg : undefined
     const { agents: all, hooks, since, transcriptBytes } = await read($, timeline)
     const chosen = await read($, selected)
+    await read($, settle) // read so the settle timer redraws the pane
+    const drawnAt = await $.clock.now()
+    let isSettling = false
     if (all.length === 0) return <Text dimColor>No activity yet.</Text>
     // "Now" is the last tick or the latest activity, not the live clock: a
     // redraw for a click then draws the same tracks, and desktop does not
@@ -544,7 +593,7 @@ export const register: Register = on => {
     // The window runs to now from where the main transcript's last TAIL bytes
     // start, or from the session's start when it was read whole.
     const t0 = since ?? Math.min(...all.map(a => a.startedAt))
-    const t1 = t
+    const t1 = axisEnd(t0, t)
     // Main first, then the latest subagents active in the window; unfinished
     // ones always stay.
     const main = all.filter(a => a.id === MAIN)
@@ -664,7 +713,7 @@ export const register: Register = on => {
     }
     const chosenAgent = all.find(a => a.id === chosen)
 
-    return (
+    const view = (
       <Box flexDirection="column" gap={1}>
         <Box flexDirection="row" gap={2}>
           <Text bold>
@@ -706,19 +755,26 @@ export const register: Register = on => {
                   )}
                 </Box>
                 {Svg ? (
-                  <Box key={`track-${agent.id}`} width={trackColumns}>
-                    <Svg
-                      source={trackSvg(
-                        track(agent, marks, t0, t1, t),
-                        STATUS_COLOR[status],
-                        `${agent.description}\n${status} · ${duration(activeMs(agent))} active · ${agent.callCount} calls`,
-                        trackColumns * CELL_PX,
-                      )}
-                      alt={`${agent.description}: ${status}`}
-                      width={trackColumns * CELL_PX}
-                      height={20}
-                      isInteractive
-                    />
+                  <Box key={`track-${agent.id}`} width={trackColumns} height={1}>
+                    {(() => {
+                      const drawn = layered(
+                        `${e.surface}:${trackColumns}:${agent.id}`,
+                        trackSvg(
+                          track(agent, marks, t0, t1, t),
+                          STATUS_COLOR[status],
+                          `${agent.description}\n${status} · ${duration(activeMs(agent))} active · ${agent.callCount} calls`,
+                          trackColumns * CELL_PX,
+                        ),
+                        drawnAt,
+                      )
+                      isSettling ||= drawn.isSettling
+                      // Later layers draw on top: the old track covers the new one while it loads.
+                      return drawn.sources.map(source => (
+                        <Box key={`${agent.id}-${sourceKey(source)}`} position="absolute" top={0} left={0}>
+                          <Svg source={source} alt={`${agent.description}: ${status}`} width={trackColumns * CELL_PX} height={20} isInteractive />
+                        </Box>
+                      ))
+                    })()}
                   </Box>
                 ) : (
                   <Box flexDirection="row" width={trackColumns}>
@@ -750,7 +806,7 @@ export const register: Register = on => {
             <Box flexDirection="row" width={trackColumns}>
               <Text dimColor>{clock(t0)}</Text>
               <Box flexGrow={1} />
-              <Text dimColor>{t1 >= t ? 'now' : clock(t1)}</Text>
+              <Text dimColor>{clock(t1)}</Text>
             </Box>
             <Box width={timeColumns}>
               <Text dimColor>active</Text>
@@ -765,5 +821,8 @@ export const register: Register = on => {
         {chosenAgent ? card(chosenAgent) : <Text dimColor>Click an agent's name for its details.</Text>}
       </Box>
     )
+    // Redraw without the old layers once the new ones have had time to load.
+    if (isSettling) $.clock.after(SETTLE_MS, () => void update($, settle, n => n + 1))
+    return view
   })
 }
