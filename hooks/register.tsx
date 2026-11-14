@@ -428,6 +428,8 @@ export const register: Register = on => {
       .catch(error => $.ui.log(`agent-timeline: /${COMMAND} is not available: ${String(error)}`))
     await edit($, MAIN, await $.clock.now())
     // Statuses age (Running → Quiet → Stalled) with no event to redraw them.
+    const started = await $.clock.now()
+    await update($, now, () => started)
     $.clock.every(15_000, () => {
       void $.clock.now().then(t => update($, now, () => t))
     })
@@ -533,9 +535,11 @@ export const register: Register = on => {
     const Svg = e.surface !== 'terminal' && 'Svg' in ui ? ui.Svg : undefined
     const { agents: all, hooks, since, transcriptBytes } = await read($, timeline)
     const chosen = await read($, selected)
-    const t = Math.max(await read($, now), await $.clock.now())
-
     if (all.length === 0) return <Text dimColor>No activity yet.</Text>
+    // "Now" is the last tick or the latest activity, not the live clock: a
+    // redraw for a click then draws the same tracks, and desktop does not
+    // reload every Svg (a visible flicker). Ticks and events still move it.
+    const t = Math.max(await read($, now), ...all.map(a => a.lastAt))
 
     // The window runs to now from where the main transcript's last TAIL bytes
     // start, or from the session's start when it was read whole.
@@ -702,7 +706,7 @@ export const register: Register = on => {
                   )}
                 </Box>
                 {Svg ? (
-                  <Box width={trackColumns}>
+                  <Box key={`track-${agent.id}`} width={trackColumns}>
                     <Svg
                       source={trackSvg(
                         track(agent, marks, t0, t1, t),

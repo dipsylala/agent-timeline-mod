@@ -251,7 +251,7 @@ test("a main transcript over the read limit is read from its last 2.5 MB, which 
 
 test('a session like a long resumed one renders', async ($, on) => {
   const NOW = 1_700_100_000_000
-  mock.clock(on, { now: NOW })
+  const clock = mock.clock(on, { now: NOW })
   const day = NOW - 3 * 3600_000
   const agents = Array.from({ length: 14 }, (_, i) => {
     const start = day + i * 10 * 60_000
@@ -304,6 +304,12 @@ test('a session like a long resumed one renders', async ($, on) => {
   // A cut name keeps its whole text for the hover card.
   expect((await ui.find({ key: 'ag13' }))?.text).toMatch(/…$/)
   expect((await ui.find({ key: 'ag13-full' }))?.text).toBe('Stage 13 correctness review with a long name')
+  // Choosing an agent redraws the tracks unchanged, so desktop does not reload them.
+  const before = (await ui.find({ type: 'Svg' }))?.props.source
+  await clock.advance(1000) // the live clock moves on between redraws
+  await ui.press({ key: 'ag1' })
+  expect((await ui.find({ type: 'Svg' }))?.props.source).toBe(before)
+
   // The hover card's own button opens the card as the cut name does.
   await ui.press({ key: 'ag0-full' })
   expect(await ui.find({ type: 'Text', text: /PostToolUse blocked Contents of/ })).toBeDefined()
