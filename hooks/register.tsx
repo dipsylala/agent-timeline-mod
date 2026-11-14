@@ -6,6 +6,8 @@ import { brief, IDLE_GAP, KEEP_CALLS, mergeAgent, mergeSpans, newHooks, parseTra
 
 const PANE = 'agent-timeline'
 const TITLE = 'Agent timeline'
+// Not "agent-timeline": the agent-timeline skill holds that command.
+const COMMAND = 'agent-timeline-pane'
 const MAIN = 'main'
 
 // The same thresholds the agent-timeline skill uses.
@@ -420,7 +422,10 @@ async function backfill($: EngineInterface, cwd: string) {
 
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
-    await $.command.register({ name: 'timeline', description: 'Show the agent timeline pane' })
+    // A name another command holds is refused; the pane must still open.
+    await $.command
+      .register({ name: COMMAND, description: 'Show the agent timeline pane' })
+      .catch(error => $.ui.log(`agent-timeline: /${COMMAND} is not available: ${String(error)}`))
     await edit($, MAIN, await $.clock.now())
     // Statuses age (Running → Quiet → Stalled) with no event to redraw them.
     $.clock.every(15_000, () => {
@@ -434,7 +439,7 @@ export const register: Register = on => {
     return next(e)
   })
 
-  on('command.run', { command: 'timeline' }, async $ => {
+  on('command.run', { command: 'agent-timeline-pane' }, async $ => {
     await $.ui.open({ id: PANE, title: TITLE })
     return { text: 'Agent timeline pane opened.' }
   })

@@ -17,7 +17,8 @@ const PANE = {
 test("a subagent's row, its calls, its result and a hook block, on every surface", async ($, on) => {
   // Each hook here stands for the engine beneath the mod.
   const clock = mock.clock(on, { now: 1_700_000_000_000 })
-  on('command.register', () => ({ value: { command: 'timeline' } }))
+  const registered: string[] = []
+  on('command.register', (_, e) => (registered.push(e.name), { value: { command: e.name } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('agent.spawn', () => ({ model: 'haiku', agentId: 'a1' }))
@@ -28,6 +29,7 @@ test("a subagent's row, its calls, its result and a hook block, on every surface
   on('turn.complete', (_, e) => ({ text: e.answer }))
 
   await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  expect(registered).toEqual(['agent-timeline-pane'])
   await $.agent.spawn({
     prompt: 'Look around the repo',
     description: 'Survey repo',
@@ -76,7 +78,7 @@ test("a subagent's row, its calls, its result and a hook block, on every surface
 
 test('a call a hook blocked stays in view when older than the latest calls', async ($, on) => {
   mock.clock(on, { now: 1_700_000_000_000 })
-  on('command.register', () => ({ value: { command: 'timeline' } }))
+  on('command.register', () => ({ value: { command: 'agent-timeline-pane' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('agent.list', () => ({ value: [{ id: 'a1', description: 'Survey repo', type: 'Explore', status: 'running' }] }))
@@ -99,7 +101,7 @@ test('a call a hook blocked stays in view when older than the latest calls', asy
 
 test('an unfinished agent silent for over ten minutes shows as stalled and needs attention', async ($, on) => {
   const clock = mock.clock(on, { now: 1_700_000_000_000 })
-  on('command.register', () => ({ value: { command: 'timeline' } }))
+  on('command.register', () => ({ value: { command: 'agent-timeline-pane' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('agent.list', () => ({ value: [{ id: 'b2', description: 'Long build', type: 'general-purpose', status: 'running' }] }))
@@ -141,7 +143,7 @@ test('agents from before the mod loaded come back from the transcripts', async (
   }
   // The engine hands paths on in the platform's form (C:\home\u\... on Windows).
   const norm = (path: string) => path.replace(/\\/g, '/').replace(/^[A-Za-z]:/, '')
-  on('command.register', () => ({ value: { command: 'timeline' } }))
+  on('command.register', () => ({ value: { command: 'agent-timeline-pane' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 's1' }))
@@ -201,7 +203,7 @@ test("a main transcript over the read limit is read from its last 2.5 MB, which 
       .join('\n'),
     [`${DIR}/subagents/agent-early.meta.json`]: JSON.stringify({ description: 'Early task', agentType: 'Explore', finished: true }),
   }
-  on('command.register', () => ({ value: { command: 'timeline' } }))
+  on('command.register', () => ({ value: { command: 'agent-timeline-pane' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 's1' }))
@@ -301,6 +303,20 @@ test('a session like a long resumed one renders', async ($, on) => {
   expect(await ui.find({ key: 'ag13' })).toBeDefined()
   await ui.press({ key: 'ag0' })
   expect(await ui.find({ type: 'Text', text: /PostToolUse blocked Contents of/ })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a refused command name does not stop the session start', async ($, on) => {
+  mock.clock(on, { now: 1_700_000_000_000 })
+  on('command.register', () => ({ deny: 'it is the user’s command' }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('ui.log', () => ({ value: undefined }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'main' }))?.text).toBe('Main session')
   await ui.unmount()
 })
 

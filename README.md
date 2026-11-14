@@ -29,7 +29,7 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt box
 - Hook markers on the bars: a red stripe for a block, purple for a hook message. Hover a bar or a stripe for details. The terminal, which draws no SVG, shows the same tracks in text cells, accurate to about one cell.
 - Clicking a name shows that agent's card below the list, one agent at a time (another name switches, the same name closes it): its status, type, start time and counts, its latest tool calls (a call a hook blocked stays listed even once older calls scroll off), hook events and result, and, in the terminal, **Open transcript** to switch the main view to that agent (the desktop app has no main view a mod can switch).
 
-The pane opens when a session starts; `/timeline` reopens it.
+The pane opens when a session starts; `/agent-timeline-pane` reopens it (not `/agent-timeline`, which is the agent-timeline skill's).
 
 ## Limits
 
