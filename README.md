@@ -33,7 +33,7 @@ The pane opens when a session starts; `/timeline` reopens it.
 
 ## Limits
 
-- It sees only what happens after it loads; an agent already running then gets its name from the engine's agent list.
+- Agents from before the mod loaded, or from a resumed session, are rebuilt from the session's transcripts under `~/.claude/projects` when the session starts. A transcript over 4 MiB (the most a mod can read at once) is skipped: in long sessions that is usually the main session's, so its row starts when the mod loaded, while subagents still come in. The transcript format is not a documented Claude Code interface, so an update can break this part.
 - No batch grouping, no file or diff viewer, no session list, no token counts (the skill has these).
 - Settings hooks that fail without blocking are not visible to it.
 - Mod hooks are an early-access Claude Code API and may change between releases.

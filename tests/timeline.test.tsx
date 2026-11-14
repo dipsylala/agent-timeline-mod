@@ -118,6 +118,67 @@ test('an unfinished agent silent for over ten minutes shows as stalled and needs
   await ui.unmount()
 })
 
+test('agents from before the mod loaded come back from the transcripts', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_100_000 })
+  const at = (s: number) => new Date(1_700_000_000_000 + s * 1000).toISOString()
+  const DIR = '/home/u/.claude/projects/-work/s1'
+  const files: Record<string, string> = {
+    [`${DIR}/subagents/agent-old1.jsonl`]: [
+      { timestamp: at(0), type: 'user', message: { content: 'Look around' } },
+      { timestamp: at(2), type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_r1', name: 'Read', input: { file_path: '/a.ts' } }] } },
+      { timestamp: at(3), type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_r1', content: 'ok' }] } },
+      { timestamp: at(4), type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_w1', name: 'Write', input: { file_path: '/b.ts' } }] } },
+      {
+        timestamp: at(5),
+        type: 'user',
+        message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_w1', is_error: true, content: 'PreToolUse:Write hook error: writes are off' }] },
+      },
+      { timestamp: at(9), type: 'assistant', message: { content: [{ type: 'text', text: 'All done.' }] } },
+    ]
+      .map(line => JSON.stringify(line))
+      .join('\n'),
+    [`${DIR}/subagents/agent-old1.meta.json`]: JSON.stringify({ description: 'Earlier survey', agentType: 'Explore', finished: true }),
+  }
+  // The engine hands paths on in the platform's form (C:\home\u\... on Windows).
+  const norm = (path: string) => path.replace(/\\/g, '/').replace(/^[A-Za-z]:/, '')
+  on('command.register', () => ({ value: { command: 'timeline' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: 's1' }))
+  on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/home/u' : undefined }))
+  // The main transcript is there but too large to read; the subagent still comes in.
+  on('fs.exists', (_, e) => ({ value: norm(e.path) === `${DIR}.jsonl` }))
+  on('fs.stat', (_, e) => ({ value: { kind: 'file', size: norm(e.path) === `${DIR}.jsonl` ? 12_000_000 : 1000, mtimeMs: 0, isLink: false } }))
+  on('fs.list', (_, e) =>
+    norm(e.path) === `${DIR}/subagents`
+      ? { value: Object.keys(files).map(path => ({ name: path.split('/').pop() ?? '', kind: 'file', size: 1000, mtimeMs: 0, isLink: false })) }
+      : { value: [] },
+  )
+  on('fs.read', (_, e) => {
+    const text = files[norm(e.path)]
+    if (text === undefined) throw new Error(`ENOENT ${e.path}`)
+    return { value: text }
+  })
+
+  const logged: string[] = []
+  on('ui.log', (_, e) => {
+    logged.push(JSON.stringify(e))
+    return { value: undefined }
+  })
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+  await clock.advance(10)
+  expect(logged).toEqual([])
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect((await ui.find({ key: 'old1' }))?.text).toBe('Earlier survey')
+  await ui.press({ key: 'old1' })
+  expect(await ui.find({ type: 'Text', text: /^Earlier survey · Done · Explore · .* · 2 calls · 1 blocked/ }), 'header').toBeDefined()
+  expect((await ui.find({ type: 'Text', text: /Write \/b.ts/ }))?.text).toMatch(/^✗/)
+  expect(await ui.find({ type: 'Text', text: /PreToolUse blocked writes are off/ }), 'hook').toBeDefined()
+  expect(await ui.find({ type: 'Markdown', text: /All done\./ }), 'result').toBeDefined()
+  await ui.unmount()
+})
+
 test('a timeline an earlier version stored is declined', async ($, on) => {
   mock.clock(on, { now: 1_700_000_000_000 })
   on('state.get', () => ({ value: { value: { agents: [{ id: 'x' }] }, version: 1 } }))

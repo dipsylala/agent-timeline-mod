@@ -2,22 +2,21 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, ThemeKey } from 'claude-code'
 
 import type { Agent, Call, HookMark, Timeline } from '../types'
+import { brief, IDLE_GAP, KEEP_CALLS, mergeAgent, newHooks, parseTranscript } from './transcript'
 
 const PANE = 'agent-timeline'
 const TITLE = 'Agent timeline'
 const MAIN = 'main'
 
 // The same thresholds the agent-timeline skill uses.
-const IDLE_GAP = 600_000 // a silence this long splits busy spans
 const RUNNING_WINDOW = 120_000 // unfinished and active this recently: Running
 const STALL_AFTER = 600_000 // unfinished and silent this long: Stalled
 const ATTENTION_WINDOW = 15 * 60_000 // hook blocks this recent count as needing attention
 
-const KEEP_CALLS = 20
 const KEEP_HOOKS = 200
 const SHOWN_ROWS = 30
 const SHOWN_CALLS = 8
-const BRIEF_KEYS = ['command', 'file_path', 'path', 'pattern', 'url', 'description', 'query', 'title', 'message', 'prompt']
+const MAX_READ = 4 * 1024 * 1024 // $.fs.read rejects a file larger than this
 
 const EMPTY: Timeline = { agents: [], hooks: [] }
 // Change the tag when Agent, Call or HookMark change shape: a reload keeps
@@ -28,17 +27,6 @@ const now = atom({ plugin: 'agent-timeline', key: 'now' } as const, 0)
 const selected = atom({ plugin: 'agent-timeline', key: 'selected' } as const, '')
 // Fit the chart to the subagents' activity, or show the whole session.
 const zoom = atom({ plugin: 'agent-timeline', key: 'zoom' } as const, 'agents' as 'agents' | 'session')
-
-function brief(input: object): string {
-  const fields = input as Record<string, unknown>
-  for (const key of BRIEF_KEYS) {
-    const value = fields[key]
-    if (typeof value === 'string' && value.trim()) {
-      return (value.trim().split('\n')[0] ?? '').replace(/^cd\s+\S+\s*&&\s*/, '').slice(0, 160)
-    }
-  }
-  return ''
-}
 
 function newAgent(id: string, t: number, description: string, type: string, parentId?: string): Agent {
   const agent: Agent = { id, description, type, parentId, startedAt: t, lastAt: t, lastCleanAt: 0, spans: [[t, t]], calls: [], callCount: 0 }
@@ -304,6 +292,69 @@ function trackSvg(pieces: Piece[], color: string, barTip: string, width: number)
   return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="20" viewBox="0 0 ${width} 20" preserveAspectRatio="none">${rects.join('')}${stripes.join('')}</svg>`
 }
 
+/** This session's transcript folder: `<id>.jsonl` beside it, `subagents/` inside it. */
+async function sessionDir($: EngineInterface, cwd: string): Promise<string | undefined> {
+  const id = await $.session.id()
+  const home = (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME')) ?? ''
+  const projects = `${(await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${home}/.claude`}/projects`
+  const guess = `${projects}/${cwd.replace(/[^A-Za-z0-9]/g, '-')}`
+  if (await $.fs.exists(`${guess}/${id}.jsonl`)) return `${guess}/${id}`
+  // The folder is named for where the session started, which may not be cwd now.
+  for (const entry of await $.fs.list(projects).catch(() => [])) {
+    if (entry.kind === 'dir' && (await $.fs.exists(`${projects}/${entry.name}/${id}.jsonl`))) return `${projects}/${entry.name}/${id}`
+  }
+  return undefined
+}
+
+/** A file's text, or undefined when it is missing or too large for one read. */
+async function readSmall($: EngineInterface, path: string): Promise<string | undefined> {
+  const stat = await $.fs.stat(path).catch(() => undefined)
+  if (!stat || stat.size > MAX_READ) return undefined
+  return $.fs.read(path).catch(() => undefined)
+}
+
+/**
+ * Adds what the transcripts hold that the live rows do not: agents from
+ * before the mod loaded or from a resumed session, and their hook blocks.
+ * A main transcript over the read limit is skipped; subagents still come in.
+ */
+async function backfill($: EngineInterface, cwd: string) {
+  const dir = await sessionDir($, cwd)
+  if (!dir) return
+  const found: { agent: Agent; hooks: HookMark[]; isMain: boolean }[] = []
+  const mainText = await readSmall($, `${dir}.jsonl`)
+  const main = mainText ? parseTranscript(mainText, { id: MAIN, description: 'Main session', type: 'main' }, { isMain: true }) : undefined
+  if (main) found.push({ ...main, isMain: true })
+  const folder = `${dir}/subagents`
+  for (const entry of await $.fs.list(folder).catch(() => [])) {
+    const id = /^agent-(.+)\.jsonl$/.exec(entry.name)?.[1]
+    if (!id || entry.kind !== 'file') continue
+    const text = await readSmall($, `${folder}/${entry.name}`)
+    if (!text) continue
+    const meta = await $.fs
+      .read(`${folder}/agent-${id}.meta.json`)
+      .then(json => JSON.parse(json) as { description?: string; agentType?: string; finished?: boolean })
+      .catch(() => ({}) as { description?: string; agentType?: string; finished?: boolean })
+    const base = { id, description: meta.description ?? `Agent ${id.slice(0, 8)}`, type: meta.agentType ?? '', parentId: MAIN }
+    const parsed = parseTranscript(text, base, { finished: meta.finished })
+    if (parsed) found.push({ ...parsed, isMain: false })
+  }
+  if (found.length === 0) return
+  await update($, timeline, tl => {
+    let agents = tl.agents
+    let hooks = tl.hooks
+    for (const { agent, hooks: marks, isMain } of found) {
+      const index = agents.findIndex(a => a.id === agent.id)
+      const merged = mergeAgent(agents[index], agent, isMain)
+      agents = index < 0 ? [...agents, merged] : agents.map((a, i) => (i === index ? merged : a))
+      hooks = [...hooks, ...newHooks(hooks, marks)]
+    }
+    // Main first, then by when each agent started.
+    agents = [...agents].sort((a, b) => (a.id === MAIN ? -1 : b.id === MAIN ? 1 : a.startedAt - b.startedAt))
+    return { agents, hooks: [...hooks].sort((a, b) => a.at - b.at).slice(-KEEP_HOOKS) }
+  })
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     await $.command.register({ name: 'timeline', description: 'Show the agent timeline pane' })
@@ -311,6 +362,10 @@ export const register: Register = on => {
     // Statuses age (Running → Quiet → Stalled) with no event to redraw them.
     $.clock.every(15_000, () => {
       void $.clock.now().then(t => update($, now, () => t))
+    })
+    // Earlier agents come from the transcripts, off the session's start.
+    $.clock.after(0, () => {
+      void backfill($, e.cwd).catch(error => $.ui.log(`agent-timeline: could not read earlier agents: ${String(error)}`))
     })
     void $.ui.open({ id: PANE, title: TITLE })
     return next(e)
