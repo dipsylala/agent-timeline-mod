@@ -181,6 +181,8 @@ test('agents from before the mod loaded come back from the transcripts', async (
   await ui.press({ key: 'main' })
   const started = new Date(1_700_000_000_000).toTimeString().slice(0, 8)
   expect(await ui.find({ type: 'Text', text: new RegExp(`^Main session · .* started ${started}`) }), 'main start').toBeDefined()
+  // No summary command answered here, so the note says how little the bars cover.
+  expect(await ui.find({ type: 'Text', text: /^Transcript too large to read \(12 MB\): bars show only when subagents started/ }), 'note').toBeDefined()
 
   // Three views of the chart's window.
   for (const key of ['view-session', 'view-agents', 'view-recent']) expect(await ui.find({ key }), key).toBeDefined()
@@ -189,7 +191,7 @@ test('agents from before the mod loaded come back from the transcripts', async (
   await ui.unmount()
 })
 
-test("a main transcript too large to read gives its entries' times from a command", async ($, on) => {
+test('a main transcript too large to read comes from a summary: times, call count, latest calls and reply', async ($, on) => {
   const clock = mock.clock(on, { now: 1_700_000_100_000 })
   const DIR = '/home/u/.claude/projects/-work/s1'
   const norm = (path: string) => path.replace(/\\/g, '/').replace(/^[A-Za-z]:/, '')
@@ -201,21 +203,40 @@ test("a main transcript too large to read gives its entries' times from a comman
   on('fs.exists', (_, e) => ({ value: norm(e.path) === `${DIR}.jsonl` }))
   on('fs.stat', () => ({ value: { kind: 'file', size: 12_000_000, mtimeMs: 0, isLink: false } }))
   on('fs.list', () => ({ value: [] }))
-  const ran: string[][] = []
+  const at = (s: number) => new Date(1_700_000_000_000 + s * 1000).toISOString()
+  // What sed, grep and tail print for the transcript (not Windows, as OS is unset here).
+  const outputs: Record<string, string> = {
+    sed: [0, 30, 60].map(s => `T ${at(s)}`).join('\n'),
+    grep: ['toolu_a', 'toolu_b', 'toolu_c'].map(id => `"type":"tool_use","id":"${id}"`).join('\n'),
+    tail: [
+      'id":"cut mid-line by tail"}',
+      JSON.stringify({ timestamp: at(50), type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_c', name: 'Bash', input: { command: 'npm test' } }] } }),
+      JSON.stringify({ timestamp: at(55), type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_c', content: 'ok' }] } }),
+      JSON.stringify({ timestamp: at(60), type: 'assistant', message: { content: [{ type: 'text', text: 'Tests pass.' }] } }),
+    ].join('\n'),
+  }
+  const ran: string[] = []
   on('process.run', (_, e) => {
-    ran.push([...e.argv])
-    const times = [0, 30, 60].map(s => new Date(1_700_000_000_000 + s * 1000).toISOString())
-    return { value: { exitCode: 0, stdout: `${times.join('\n')}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    const command = e.argv[0] ?? ''
+    ran.push(command)
+    return { value: { exitCode: 0, stdout: `${outputs[command] ?? ''}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
 
   await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
   await clock.advance(10)
-  expect(ran[0]?.[0]).toBe('sed')
+  expect(ran).toEqual(['sed', 'grep', 'tail'])
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'main' })
   const started = new Date(1_700_000_000_000).toTimeString().slice(0, 8)
-  expect(await ui.find({ type: 'Text', text: new RegExp(`^Main session · .* started ${started}`) })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: new RegExp(`^Main session · .* started ${started} · 3 calls`) }), 'header').toBeDefined()
+  expect((await ui.find({ type: 'Text', text: /Bash npm test/ }))?.text, 'latest call').toMatch(/^✓/)
+  expect(await ui.find({ type: 'Markdown', text: /Tests pass\./ }), 'latest reply').toBeDefined()
+  const since = new Date(1_700_000_050_000).toTimeString().slice(0, 8)
+  expect(
+    (await ui.find({ type: 'Text', text: /^Transcript too large/ }))?.text,
+    'note',
+  ).toBe(`Transcript too large to read whole (12 MB): hook events from its last 2.5 MB only, since ${since}.`)
   await ui.unmount()
 })
 

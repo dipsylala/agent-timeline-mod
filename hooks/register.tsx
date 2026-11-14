@@ -314,44 +314,113 @@ async function readSmall($: EngineInterface, path: string): Promise<string | und
   return $.fs.read(path).catch(() => undefined)
 }
 
-// Each transcript line's own time is its last "timestamp" field: Claude Code
-// writes it after the message, which may quote other timestamps. A plain
-// last-index search, as a regex on multi-megabyte lines is slow.
-const TIMES_PS = [
-  '$r = [IO.StreamReader]::new($env:AGENT_TIMELINE_FILE); $k = \'"timestamp":"\'',
-  'while ($null -ne ($l = $r.ReadLine())) { $i = $l.LastIndexOf($k); if ($i -ge 0) { $s = $i + $k.Length; $e = $l.IndexOf(\'"\', $s); if ($e -gt $s) { $l.Substring($s, $e - $s) } } }',
+// For a transcript too large for `$.fs.read`, a command prints a summary the
+// mod can take in: `T <time>` for each line (its last "timestamp" field, as
+// Claude Code writes the entry's own time after the message, which may quote
+// others), `U <id>` for each tool call, then `<<TAIL>>` and the file's last
+// TAIL bytes, which hold the latest calls, reply and hook blocks. Plain index
+// searches, as a regex on multi-megabyte lines is slow.
+const TAIL = 2_500_000
+const TAIL_MARK = '<<TAIL>>'
+const SUMMARY_PS = [
+  '$o = [Console]::Out; [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)',
+  `$p = $env:AGENT_TIMELINE_FILE; $k = '"timestamp":"'; $u = '"type":"tool_use","id":"'`,
+  '$r = [IO.StreamReader]::new($p)',
+  'while ($null -ne ($l = $r.ReadLine())) {' +
+    ' $i = $l.LastIndexOf($k); if ($i -ge 0) { $s = $i + $k.Length; $e = $l.IndexOf(\'"\', $s); if ($e -gt $s) { $o.WriteLine(\'T \' + $l.Substring($s, $e - $s)) } }' +
+    ' $j = $l.IndexOf($u); while ($j -ge 0) { $s = $j + $u.Length; $e = $l.IndexOf(\'"\', $s); if ($e -le $s) { break }; $o.WriteLine(\'U \' + $l.Substring($s, $e - $s)); $j = $l.IndexOf($u, $e) }' +
+    ' }',
   '$r.Close()',
+  `$o.WriteLine('${TAIL_MARK}')`,
+  `$f = [IO.File]::OpenRead($p); $n = [Math]::Min($f.Length, ${TAIL}); [void]$f.Seek(-$n, 'End')`,
+  '$b = New-Object byte[] $n; $got = 0; while ($got -lt $n) { $got += $f.Read($b, $got, $n - $got) }; $f.Close()',
+  '$o.Write([Text.Encoding]::UTF8.GetString($b)); $o.Flush()',
 ].join('; ')
 
+type LargeTranscript = { times: number[]; callIds: Set<string>; tail: string }
+
 /**
- * The time of every entry in a transcript too large for `$.fs.read`, read by
- * a command (PowerShell on Windows, sed elsewhere) that prints only those;
- * empty when the command is missing or fails.
+ * The summary of a transcript too large to read whole: PowerShell on Windows,
+ * sed, grep and tail elsewhere. Undefined when the commands are missing or fail.
  */
-async function entryTimes($: EngineInterface, path: string): Promise<number[]> {
-  const isWindows = (await $.env.get('OS')) === 'Windows_NT'
-  const argv = isWindows
-    ? ['powershell', '-NoProfile', '-NonInteractive', '-Command', TIMES_PS]
-    : ['sed', '-n', 's/.*"timestamp":"\\([^"]*\\)".*/\\1/p', path]
-  const run = await $.process.run(argv, { env: { AGENT_TIMELINE_FILE: path }, timeoutMs: 60_000 }).catch(() => undefined)
-  if (!run || run.exitCode !== 0) return []
-  return run.stdout
-    .split('\n')
-    .map(line => Date.parse(line.trim()))
-    .filter(at => !Number.isNaN(at))
+async function readLarge($: EngineInterface, path: string, size: number): Promise<LargeTranscript | undefined> {
+  const init = { env: { AGENT_TIMELINE_FILE: path }, timeoutMs: 60_000 }
+  const run = (argv: string[]) => $.process.run(argv, init).catch(() => undefined)
+  let summary: string
+  let tail: string
+  if ((await $.env.get('OS')) === 'Windows_NT') {
+    const out = await run(['powershell', '-NoProfile', '-NonInteractive', '-Command', SUMMARY_PS])
+    if (!out || out.exitCode !== 0) return undefined
+    // WriteLine ends lines with \r\n on Windows.
+    const cut = out.stdout.search(new RegExp(`${TAIL_MARK}\\r?\\n`))
+    if (cut < 0) return undefined
+    summary = out.stdout.slice(0, cut)
+    tail = out.stdout.slice(out.stdout.indexOf('\n', cut) + 1)
+  } else {
+    const times = await run(['sed', '-n', 's/.*"timestamp":"\\([^"]*\\)".*/T \\1/p', path])
+    // grep exits 1 when nothing matches: no calls, not a failure.
+    const ids = await run(['grep', '-o', '"type":"tool_use","id":"[^"]*"', path])
+    const end = await run(['tail', '-c', String(TAIL), path])
+    if (times?.exitCode !== 0 || !ids || ids.exitCode > 1 || end?.exitCode !== 0) return undefined
+    summary = `${times.stdout}\n${ids.stdout.replace(/^"type":"tool_use","id":"([^"]*)"$/gm, 'U $1')}`
+    tail = end.stdout
+  }
+  const times: number[] = []
+  const callIds = new Set<string>()
+  for (const line of summary.split(/\r?\n/)) {
+    if (line.startsWith('T ')) {
+      const at = Date.parse(line.slice(2))
+      if (!Number.isNaN(at)) times.push(at)
+    } else if (line.startsWith('U ')) callIds.add(line.slice(2))
+  }
+  // The tail starts mid-line unless it is the whole file.
+  return { times, callIds, tail: size > TAIL ? tail.slice(tail.indexOf('\n') + 1) : tail }
+}
+
+function megabytes(bytes: number): string {
+  return `${(bytes / 1e6).toFixed(bytes < 10e6 ? 1 : 0)} MB`
+}
+
+/** The main session's row from a transcript too large to read whole. */
+function largeMain(large: LargeTranscript, size: number): { agent: Agent; hooks: HookMark[] } | undefined {
+  const recent = parseTranscript(large.tail, { id: MAIN, description: 'Main session', type: 'main' }, { isMain: true })
+  // Bars and the call count cover the whole transcript; hook events only its tail.
+  const since = recent ? `, since ${clock(recent.agent.startedAt)}` : ''
+  const note = size > TAIL ? `Transcript too large to read whole (${megabytes(size)}): hook events from its last ${megabytes(TAIL)} only${since}.` : undefined
+  if (large.times.length === 0) return recent && { ...recent, agent: { ...recent.agent, note } }
+  const agent: Agent = {
+    id: MAIN,
+    description: 'Main session',
+    type: 'main',
+    startedAt: Math.min(...large.times),
+    lastAt: Math.max(...large.times),
+    lastCleanAt: recent?.agent.lastCleanAt ?? 0,
+    spans: mergeSpans(large.times.map((at): [number, number] => [at, at])),
+    calls: recent?.agent.calls ?? [],
+    callCount: Math.max(large.callIds.size, recent?.agent.callCount ?? 0),
+    result: recent?.agent.result,
+    note,
+  }
+  return { agent, hooks: recent?.hooks ?? [] }
 }
 
 /**
  * Adds what the transcripts hold that the live rows do not: agents from
  * before the mod loaded or from a resumed session, and their hook blocks.
- * A main transcript over the read limit gives its entries' times alone.
+ * A main transcript over the read limit comes from a command's summary.
  */
 async function backfill($: EngineInterface, cwd: string) {
   const dir = await sessionDir($, cwd)
   if (!dir) return
   const found: { agent: Agent; hooks: HookMark[]; isMain: boolean }[] = []
-  const mainText = await readSmall($, `${dir}.jsonl`)
-  const main = mainText ? parseTranscript(mainText, { id: MAIN, description: 'Main session', type: 'main' }, { isMain: true }) : undefined
+  const mainPath = `${dir}.jsonl`
+  const mainText = await readSmall($, mainPath)
+  let main = mainText ? parseTranscript(mainText, { id: MAIN, description: 'Main session', type: 'main' }, { isMain: true }) : undefined
+  const mainSize = mainText ? 0 : ((await $.fs.stat(mainPath).catch(() => undefined))?.size ?? 0)
+  if (mainSize > 0) {
+    const large = await readLarge($, mainPath, mainSize)
+    main = large ? largeMain(large, mainSize) : undefined
+  }
   if (main) found.push({ ...main, isMain: true })
   const folder = `${dir}/subagents`
   for (const entry of await $.fs.list(folder).catch(() => [])) {
@@ -367,14 +436,10 @@ async function backfill($: EngineInterface, cwd: string) {
     const parsed = parseTranscript(text, base, { finished: meta.finished })
     if (parsed) found.push({ ...parsed, isMain: false })
   }
-  if (!main) {
-    // The main transcript is too large to read whole. Its entries' times come
-    // from a small command; failing that, the main session was at least busy
-    // when it launched each subagent and when each handed back.
-    const times = await entryTimes($, `${dir}.jsonl`)
-    const moments = times.length > 0 ? times : found.flatMap(({ agent }) => [agent.startedAt, agent.lastAt])
-    if (moments.length === 0) return
-    const spans = mergeSpans(moments.map((at): [number, number] => [at, at]))
+  if (!main && found.length > 0) {
+    // No summary of the main transcript either: the main session was at least
+    // busy when it launched each subagent and when each handed back.
+    const moments = found.flatMap(({ agent }) => [agent.startedAt, agent.lastAt])
     found.push({
       agent: {
         id: MAIN,
@@ -383,9 +448,13 @@ async function backfill($: EngineInterface, cwd: string) {
         startedAt: Math.min(...moments),
         lastAt: Math.max(...moments),
         lastCleanAt: 0,
-        spans,
+        spans: mergeSpans(moments.map((at): [number, number] => [at, at])),
         calls: [],
         callCount: 0,
+        note:
+          mainSize > 0
+            ? `Transcript too large to read (${megabytes(mainSize)}): bars show only when subagents started and finished; earlier calls aren't listed.`
+            : undefined,
       },
       hooks: [],
       isMain: true,
@@ -601,6 +670,7 @@ export const register: Register = on => {
             </Text>
             <Text dimColor> · {details.join(' · ')}</Text>
           </Text>
+          {agent.note && <Text dimColor>{agent.note}</Text>}
 
           <Box flexDirection="column">
             <Text dimColor bold>

@@ -37,6 +37,8 @@ export type Agent = {
   calls: Call[]
   callCount: number
   result?: string
+  /** What the row leaves out, when its transcript could not be read whole. */
+  note?: string
 }
 
 export type Timeline = { agents: Agent[]; hooks: HookMark[] }

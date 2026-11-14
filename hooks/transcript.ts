@@ -186,6 +186,8 @@ export function mergeAgent(live: Agent | undefined, past: Agent, isMain: boolean
     // The main session's state is the live one; a subagent's meta file may know it finished.
     ...(isMain || live.endedAt !== undefined ? {} : { endedAt: past.endedAt, ending: past.ending }),
     result: live.result ?? past.result,
+    // The latest read of the transcript says what it could not cover.
+    note: past.note ?? live.note,
   }
 }
 
