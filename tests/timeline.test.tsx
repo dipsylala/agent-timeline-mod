@@ -46,25 +46,35 @@ test("a subagent's row, its calls, its result and a hook block, on every surface
 
   for (const surface of ['terminal', 'desktop', 'vscode', 'mobile'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect((await ui.find({ type: 'Text', text: /^1 agent/ }))?.text).toBe('1 agent · 1 done')
-    const row = await ui.find({ key: 'a1' })
-    expect(row?.text).toMatch(/Survey repo/)
-    expect(row?.text).toMatch(/Done · .* · 2 calls · 1 blocked/)
-    // The block's diamond sits on the chart as a Button of its own.
-    expect((await ui.find({ key: 'mark-0' }))?.text).toBe('◆')
+    expect((await ui.find({ type: 'Text', text: /^1 agent/ }))?.text).toBe('1 agent')
+    expect(await ui.find({ type: 'Text', text: /● 1 done/ })).toBeDefined()
+    expect((await ui.find({ key: 'a1' }))?.text).toBe('Survey repo')
+    // The track is an Svg where the surface draws one, else cells with the block's stripe.
+    if (surface === 'terminal') expect(await ui.find({ key: 'mark-0' }), surface).toBeDefined()
+    else expect(await ui.find({ type: 'Svg' }), surface).toBeDefined()
     await ui.unmount()
   }
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.press({ key: 'a1' })
+  expect(await ui.find({ type: 'Text', text: /Done · Explore · started .* · 2 calls · 1 blocked/ })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /Bash ls -la/ })).toBeDefined()
   expect((await ui.find({ type: 'Text', text: /Write \/x.txt/ }))?.text).toMatch(/^✗/)
-  expect(await ui.find({ type: 'Text', text: /PreToolUse hook blocked .*no writes here/ })).toBeDefined()
-  expect(await ui.find({ key: 'view-a1' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /PreToolUse blocked no writes here/ })).toBeDefined()
+  // The desktop has no main view to switch, so no Open transcript there.
+  expect(await ui.find({ key: 'view-a1' })).toBeUndefined()
+
+  // One agent's details at a time: choosing another replaces them, choosing it again closes them.
+  await ui.press({ key: 'main' })
+  expect(await ui.find({ type: 'Text', text: /^Main session · Idle/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Bash ls -la/ })).toBeUndefined()
+  await ui.press({ key: 'main' })
+  expect(await ui.find({ type: 'Text', text: /^Main session · Idle/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /Click an agent's name/ })).toBeDefined()
   await ui.unmount()
 })
 
-test('clicking a diamond opens its row at the call the hook fired on', async ($, on) => {
+test('a call a hook blocked stays in view when older than the latest calls', async ($, on) => {
   mock.clock(on, { now: 1_700_000_000_000 })
   on('command.register', () => ({ value: { command: 'timeline' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
@@ -79,10 +89,11 @@ test('clicking a diamond opens its row at the call the hook fired on', async ($,
   for (let i = 0; i < 10; i++) await $.tool.call({ tool: 'Bash', command: `echo ${i}`, agentId: 'a1', tool_use_id: `b${i}` })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await ui.find({ type: 'Text', text: /Write \/x.txt/ })).toBeUndefined()
-  await ui.press({ key: 'mark-0' })
-  expect((await ui.find({ type: 'Text', text: /Write \/x.txt/ }))?.text).toMatch(/^→ ✗ .* Write \/x.txt/)
-  expect((await ui.find({ type: 'Text', text: /PreToolUse hook blocked/ }))?.text).toMatch(/^→ ◆/)
+  await ui.press({ key: 'a1' })
+  expect((await ui.find({ type: 'Text', text: /Write \/x.txt/ }))?.text).toMatch(/^✗ .* Write \/x.txt/)
+  expect(await ui.find({ type: 'Text', text: /^⋮$/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Bash echo 9/ })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Bash echo 1$/ })).toBeUndefined()
   await ui.unmount()
 })
 
@@ -99,10 +110,11 @@ test('an unfinished agent silent for over ten minutes shows as stalled and needs
   await $.tool.call({ tool: 'Bash', command: 'make', agentId: 'b2', tool_use_id: 't9' })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect((await ui.find({ key: 'b2' }))?.text).toMatch(/Long build .*Running/)
+  await ui.press({ key: 'b2' })
+  expect((await ui.find({ type: 'Text', text: /· general-purpose ·/ }))?.text).toMatch(/^Long build · Running/)
   await clock.advance(11 * 60_000)
-  expect((await ui.find({ key: 'b2' }))?.text).toMatch(/Stalled/)
-  expect((await ui.find({ type: 'Text', text: /Needs attention/ }))?.text).toBe('Needs attention: Long build (stalled)')
+  expect((await ui.find({ type: 'Text', text: /· general-purpose ·/ }))?.text).toMatch(/^Long build · Stalled/)
+  expect((await ui.find({ type: 'Text', text: /Needs attention/ }))?.text).toBe('⚠ Needs attention: Long build (stalled)')
   await ui.unmount()
 })
 

@@ -46,9 +46,10 @@ declare module 'claude-code' {
     'agent-timeline': {
       timeline: Shaped<Timeline>
       now: number
-      expanded: string[]
-      /** The `at` of the hook marker last clicked; 0 for none. */
-      focused: number
+      /** The agent whose details show below the list; '' for none. */
+      selected: string
+      /** Fit the chart to the subagents' activity, or show the whole session. */
+      zoom: 'agents' | 'session'
     }
   }
 }

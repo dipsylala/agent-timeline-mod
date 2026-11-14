@@ -24,9 +24,10 @@ const EMPTY: Timeline = { agents: [], hooks: [] }
 // what the earlier version stored, and the tag declines it.
 const timeline = atom({ plugin: 'agent-timeline', key: 'timeline' } as const, EMPTY, { shape: 'timeline-1' })
 const now = atom({ plugin: 'agent-timeline', key: 'now' } as const, 0)
-const expanded = atom({ plugin: 'agent-timeline', key: 'expanded' } as const, [] as string[])
-// The at of the hook marker last clicked; 0 for none.
-const focused = atom({ plugin: 'agent-timeline', key: 'focused' } as const, 0)
+// The agent whose details show below the list; '' for none.
+const selected = atom({ plugin: 'agent-timeline', key: 'selected' } as const, '')
+// Fit the chart to the subagents' activity, or show the whole session.
+const zoom = atom({ plugin: 'agent-timeline', key: 'zoom' } as const, 'agents' as 'agents' | 'session')
 
 function brief(input: object): string {
   const fields = input as Record<string, unknown>
@@ -164,26 +165,34 @@ function needsAttention(agents: Agent[], hooks: HookMark[], t: number): string[]
 }
 
 /** One stretch of an agent's track: empty, busy, or a hook marker (its index in the hooks list). */
-type Piece = { kind: 'gap' | 'bar'; pct: number } | { kind: 'mark'; index: number; hook: HookMark }
+type Mark = { index: number; hook: HookMark }
+type Piece = { kind: 'gap' | 'bar'; pct: number } | ({ kind: 'mark'; onBar: boolean } & Mark)
 
 /**
- * An agent's track from t0 to t as stretches in percent of its width, with
- * each hook marker placed at its time between them.
+ * An agent's track over the window t0..t1 as stretches in percent of its
+ * width, with each hook marker in the window placed at its time between them.
  */
-function track(agent: Agent, marks: { index: number; hook: HookMark }[], t0: number, t: number): Piece[] {
-  const range = Math.max(t - t0, 1)
+function track(agent: Agent, marks: { index: number; hook: HookMark }[], t0: number, t1: number, t: number): Piece[] {
+  const range = Math.max(t1 - t0, 1)
   const pos = (at: number) => Math.min(100, Math.max(0, ((at - t0) / range) * 100))
   // A running agent's last span reaches toward now; every span shows at least a sliver.
-  const spans = agent.spans.map(([a, b], i): [number, number] => {
-    const isLast = i === agent.spans.length - 1
-    const end = agent.endedAt === undefined && isLast ? Math.max(b, Math.min(t, b + RUNNING_WINDOW)) : b
-    return [pos(a), Math.max(pos(end), Math.min(100, pos(a) + 0.8))]
-  })
-  const markAt = marks.map(m => ({ ...m, pct: pos(m.hook.at) })).sort((x, y) => x.pct - y.pct)
+  const spans = agent.spans
+    .map(([a, b], i): [number, number] => {
+      const isLast = i === agent.spans.length - 1
+      return [a, agent.endedAt === undefined && isLast ? Math.max(b, Math.min(t, b + RUNNING_WINDOW)) : b]
+    })
+    .filter(([a, b]) => b >= t0 && a <= t1)
+    .map(([a, b]): [number, number] => [pos(a), Math.max(pos(b), Math.min(100, pos(a) + 0.8))])
+  const markAt = marks
+    .filter(m => m.hook.at >= t0 && m.hook.at <= t1)
+    .map(m => ({ ...m, pct: pos(m.hook.at) }))
+    .sort((x, y) => x.pct - y.pct)
   const points = [...new Set([0, 100, ...spans.flat(), ...markAt.map(m => m.pct)])].sort((x, y) => x - y)
   const pieces: Piece[] = []
   points.forEach((p, i) => {
-    for (const m of markAt) if (m.pct === p) pieces.push({ kind: 'mark', index: m.index, hook: m.hook })
+    for (const m of markAt) {
+      if (m.pct === p) pieces.push({ kind: 'mark', index: m.index, hook: m.hook, onBar: spans.some(([a, b]) => a <= p && p <= b) })
+    }
     const next = points[i + 1]
     if (next === undefined || next <= p) return
     const mid = (p + next) / 2
@@ -195,30 +204,104 @@ function track(agent: Agent, marks: { index: number; hook: HookMark }[], t0: num
   return pieces
 }
 
-type Cell = { kind: 'gap' | 'bar'; cells: number } | { kind: 'mark'; index: number; hook: HookMark }
+/** A bar holds the hook markers that fall on it, each at a cell offset from its start. */
+type Cell =
+  | { kind: 'gap'; cells: number }
+  | { kind: 'bar'; cells: number; marks: (Mark & { offset: number })[] }
+  | ({ kind: 'mark' } & Mark)
 
 /**
  * A track's stretches as whole cells across `columns`. Rounding runs on the
- * total so far, a diamond takes one cell from what follows it, and a bar
- * keeps at least one cell.
+ * total so far, a marker takes one cell from what follows it, and a bar
+ * keeps at least one cell. A marker on a bar joins that bar, so the bar
+ * stays one piece around it.
  */
 function inCells(pieces: Piece[], columns: number): Cell[] {
   const out: Cell[] = []
   let pct = 0
   let used = 0
   for (const piece of pieces) {
+    const last = out.at(-1)
     if (piece.kind === 'mark') {
-      out.push(piece)
+      const mark = { index: piece.index, hook: piece.hook }
+      if (piece.onBar && last?.kind === 'bar') {
+        last.marks.push({ ...mark, offset: last.cells })
+        last.cells += 1
+      } else if (piece.onBar) {
+        out.push({ kind: 'bar', cells: 1, marks: [{ ...mark, offset: 0 }] })
+      } else {
+        out.push({ kind: 'mark', ...mark })
+      }
       used += 1
       continue
     }
     pct += piece.pct
     let cells = Math.max(0, Math.round((pct / 100) * columns) - used)
-    if (piece.kind === 'bar' && cells === 0) cells = 1
-    if (cells > 0) out.push({ kind: piece.kind, cells })
+    if (piece.kind === 'bar' && cells === 0 && last?.kind !== 'bar') cells = 1
     used += cells
+    if (cells === 0) continue
+    if (piece.kind === 'bar' && last?.kind === 'bar') last.cells += cells
+    else out.push(piece.kind === 'bar' ? { kind: 'bar', cells, marks: [] } : { kind: 'gap', cells })
   }
   return out
+}
+
+// An Svg cannot take theme keys: mid tones that read on light and dark backgrounds.
+const STATUS_COLOR: Record<Status, string> = {
+  Running: '#3b82f6',
+  Quiet: '#8b9bb4',
+  Stalled: '#f59e0b',
+  Done: '#16a34a',
+  Idle: '#16a34a',
+  Failed: '#dc2626',
+  Stopped: '#9ca3af',
+}
+
+// Desktop draws an Svg with no `width` at about 300px, whatever its slot, and
+// takes `width` in CSS pixels while a Box is sized in cells. This is about one
+// cell of the desktop pane's text, measured from a screenshot; a little under,
+// so the drawing stays inside its track.
+const CELL_PX = 8.5
+
+function xml(text: string): string {
+  return text.replace(/[&<>"']/g, c => `&#${c.charCodeAt(0)};`)
+}
+
+/**
+ * One agent's track as an Svg for the surfaces that draw one: thin rounded
+ * bars with room above and below, and each hook marker a slim stripe the
+ * full height, with tooltips. Bars a marker splits are drawn as one.
+ *
+ * Drawn as an image, the markup needs a size of its own (`100%` gives none,
+ * and the image falls back to 300×150). It is `width` units wide, wider than
+ * the slot so it always shrinks to fill it, and stretched across with the
+ * height held by the Svg's own `height`.
+ */
+function trackSvg(pieces: Piece[], color: string, barTip: string, width: number): string {
+  const x = (pct: number) => ((pct / 100) * width).toFixed(1)
+  const bars: { x: number; w: number }[] = []
+  const stripes: string[] = []
+  let pct = 0
+  for (const piece of pieces) {
+    if (piece.kind === 'mark') {
+      const fill = piece.hook.kind === 'blocked' ? '#dc2626' : '#a855f7'
+      const tip = `${piece.hook.event} hook ${piece.hook.kind} at ${clock(piece.hook.at)}\n${piece.hook.text.slice(0, 400)}`
+      stripes.push(
+        `<rect x="${x(pct)}" y="1" width="4" height="18" rx="1.5" fill="${fill}" transform="translate(-2 0)"><title>${xml(tip)}</title></rect>`,
+      )
+      continue
+    }
+    const last = bars.at(-1)
+    if (piece.kind === 'bar') {
+      if (last && Math.abs(last.x + last.w - pct) < 0.001) last.w += piece.pct
+      else bars.push({ x: pct, w: piece.pct })
+    }
+    pct += piece.pct
+  }
+  const rects = bars.map(
+    b => `<rect x="${x(b.x)}" y="5" width="${x(b.w)}" height="10" rx="5" fill="${color}"><title>${xml(barTip)}</title></rect>`,
+  )
+  return `<svg xmlns="http://www.w3.org/2000/svg" width="${width}" height="20" viewBox="0 0 ${width} 20" preserveAspectRatio="none">${rects.join('')}${stripes.join('')}</svg>`
 }
 
 export const register: Register = on => {
@@ -321,10 +404,13 @@ export const register: Register = on => {
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
-    const { Box, Text, Button, Markdown } = $.ui.resolve(e)
+    const ui = $.ui.resolve(e)
+    const { Box, Text, Button, Markdown } = ui
+    // The terminal's table carries an Svg at run time that draws nothing there.
+    const Svg = e.surface !== 'terminal' && 'Svg' in ui ? ui.Svg : undefined
     const { agents: all, hooks } = await read($, timeline)
-    const open = await read($, expanded)
-    const focus = await read($, focused)
+    const chosen = await read($, selected)
+    const fitAgents = (await read($, zoom)) === 'agents'
     const t = Math.max(await read($, now), await $.clock.now())
 
     if (all.length === 0) return <Text dimColor>No activity yet.</Text>
@@ -336,127 +422,210 @@ export const register: Register = on => {
     const finished = rest.filter(a => a.endedAt !== undefined).slice(-Math.max(0, SHOWN_ROWS - 1 - unfinished.length))
     const shown = [...main, ...rest.filter(a => unfinished.includes(a) || finished.includes(a))]
     const hidden = all.length - shown.length
-    const t0 = Math.min(...shown.map(a => a.startedAt))
+
+    // The window: the subagents' own activity with a margin, or the whole session.
+    const subs = shown.filter(a => a.id !== MAIN)
+    const isFitted = fitAgents && subs.length > 0
+    const first = Math.min(...(isFitted ? subs : shown).map(a => a.startedAt))
+    const last = isFitted && subs.every(a => a.endedAt !== undefined) ? Math.max(...subs.map(a => a.lastAt)) : t
+    const margin = isFitted ? Math.max((last - first) * 0.05, 1000) : 0
+    const t0 = first - margin
+    const t1 = Math.min(t, last + margin)
 
     const counts = new Map<Status, number>()
     for (const agent of rest) counts.set(statusOf(agent, t), (counts.get(statusOf(agent, t)) ?? 0) + 1)
-    const summary = [`${rest.length} agent${rest.length === 1 ? '' : 's'}`, ...[...counts].map(([s, n]) => `${n} ${s.toLowerCase()}`)].join(' · ')
     const attention = needsAttention(all, hooks, t)
-    const labelColumns = Math.max(12, Math.min(28, Math.floor(e.props.bodyColumns * 0.3)))
-    const trackColumns = Math.max(10, e.props.bodyColumns - labelColumns - 1)
+    const labelColumns = Math.max(14, Math.min(30, Math.floor(e.props.bodyColumns * 0.32)))
+    const timeColumns = 8
+    const trackColumns = Math.max(10, e.props.bodyColumns - labelColumns - timeColumns - 2)
+    const shortLabel =(text: string) => (text.length > labelColumns - 3 ? `${text.slice(0, labelColumns - 4)}…` : text)
 
-    const toggle = (id: string) => update($, expanded, list => (list.includes(id) ? list.filter(x => x !== id) : [...list, id]))
-    // A diamond opens its agent's row at the call the hook fired on.
-    const focusHook = async (hook: HookMark, agentId: string) => {
-      await update($, expanded, list => (list.includes(agentId) ? list : [...list, agentId]))
-      await update($, focused, () => hook.at)
+    // One agent's details at a time: another name switches to it, its own closes it.
+    const choose = (id: string) => update($, selected, current => (current === id ? '' : id))
+    const marksOf = (agent: Agent) => hooks.map((hook, index) => ({ hook, index })).filter(m => ownerOf(m.hook, all) === agent.id)
+    // Where no Svg is drawn (the terminal) a hook marker is a one-cell stripe,
+    // red for a block and purple for a message.
+    const stripe = (mark: Mark) => (
+      <Box key={`mark-${mark.index}`} width={1} height={1} backgroundColor={mark.hook.kind === 'blocked' ? 'error' : 'remember'} />
+    )
+
+    // Only the terminal has a main view to switch: the desktop answers "no main
+    // view here". Elsewhere it can still refuse (the tasks list has no row for
+    // the agent…); say why rather than doing nothing.
+    const canOpenTranscript = e.surface === 'terminal'
+    const openTranscript = async (agentId: string) => {
+      const moved = await $.ui.view({ agentId })
+      if (moved.deny) await $.ui.toast(`Couldn't open the transcript: ${moved.deny}`)
     }
+
+    const card = (agent: Agent) => {
+      const status = statusOf(agent, t)
+      // Never name a variable `h`: JSX compiles to calls of the global `h`.
+      const own = marksOf(agent).map(m => m.hook)
+      const blocked = own.filter(hook => hook.kind === 'blocked')
+      // A call a hook blocked stays in view even when it is older than the latest few.
+      const blockedCalls = new Set(blocked.map(hook => hook.toolUseId))
+      const latest = agent.calls.slice(-SHOWN_CALLS)
+      const older = agent.calls.filter(c => blockedCalls.has(c.id) && !latest.includes(c))
+      const calls = [...older, ...latest]
+      const hookLines = own.slice(-5)
+      const details = [
+        agent.id === MAIN ? undefined : agent.type,
+        `started ${clock(agent.startedAt)}`,
+        `${agent.callCount} call${agent.callCount === 1 ? '' : 's'}`,
+        blocked.length > 0 ? `${blocked.length} blocked` : undefined,
+      ].filter(Boolean)
+
+      return (
+        <Box key={`card-${agent.id}`} flexDirection="column" gap={1} borderStyle="round" borderColor="subtle" paddingLeft={1} paddingRight={1}>
+          <Text>
+            <Text bold>{agent.description}</Text>
+            <Text dimColor> · </Text>
+            <Text color={STATUS_THEME[status]} bold>
+              {status}
+            </Text>
+            <Text dimColor> · {details.join(' · ')}</Text>
+          </Text>
+
+          <Box flexDirection="column">
+            <Text dimColor bold>
+              TOOL CALLS
+            </Text>
+            {calls.length === 0 && <Text dimColor>None yet.</Text>}
+            {calls.map((c, i) => (
+              <Box key={`call-${agent.id}-${c.id}`} flexDirection="column">
+                {older.length > 0 && i === older.length && <Text dimColor>⋮</Text>}
+                <Text wrap="truncate-end">
+                  <Text color={c.isError ? 'error' : 'success'}>{c.endAt === undefined ? '…' : c.isError ? '✗' : '✓'}</Text>{' '}
+                  <Text dimColor>{clock(c.at)}</Text> <Text color={c.isError ? 'error' : undefined}>{c.tool}</Text>{' '}
+                  <Text dimColor>{c.brief}</Text>
+                </Text>
+              </Box>
+            ))}
+          </Box>
+
+          {hookLines.length > 0 && (
+            <Box flexDirection="column">
+              <Text dimColor bold>
+                HOOKS
+              </Text>
+              {hookLines.map(hook => (
+                <Text wrap="truncate-end">
+                  <Text color={hook.kind === 'blocked' ? 'error' : 'remember'}>▌</Text> <Text dimColor>{clock(hook.at)}</Text>{' '}
+                  <Text color={hook.kind === 'blocked' ? 'error' : 'remember'}>
+                    {hook.event} {hook.kind}
+                  </Text>{' '}
+                  <Text dimColor>{hook.text.split('\n')[0]}</Text>
+                </Text>
+              ))}
+            </Box>
+          )}
+
+          {agent.result && (
+            <Box flexDirection="column">
+              <Text dimColor bold>
+                {agent.id === MAIN ? 'LATEST REPLY' : 'RESULT'}
+              </Text>
+              <Markdown key={`result-${agent.id}`} text={agent.result.slice(0, 1500)} />
+            </Box>
+          )}
+
+          {canOpenTranscript && agent.id !== MAIN && (
+            <Box flexDirection="row">
+              <Button key={`view-${agent.id}`} label="Open transcript" onPress={() => void openTranscript(agent.id)} />
+            </Box>
+          )}
+        </Box>
+      )
+    }
+    const chosenAgent = all.find(a => a.id === chosen)
 
     return (
       <Box flexDirection="column" gap={1}>
-        <Text bold>{summary}</Text>
-        {attention.length > 0 && <Text color="warning">Needs attention: {attention.join(', ')}</Text>}
-        <Box flexDirection="column">
-          {shown.map(agent => {
-            // Never name a variable `h`: JSX compiles to calls of the global `h`.
-            const marks = hooks.map((hook, index) => ({ hook, index })).filter(m => ownerOf(m.hook, all) === agent.id && m.hook.at >= t0)
-            return (
-              <Box key={`track-${agent.id}`} flexDirection="row">
-                <Box width={labelColumns}>
-                  <Text dimColor wrap="truncate-end">{agent.description}</Text>
-                </Box>
-                <Box flexDirection="row" flexGrow={1} overflow="hidden">
-                  {inCells(track(agent, marks, t0, t), trackColumns).map((piece, i) =>
-                    piece.kind === 'mark' ? (
-                      // Desktop draws no colour on a Button's text, so the colour is the cell behind it.
-                      <Box key={`mark-box-${piece.index}`} backgroundColor={piece.hook.kind === 'blocked' ? 'error' : 'remember'}>
-                        <Button key={`mark-${piece.index}`} plain onPress={() => void focusHook(piece.hook, agent.id)}>
-                          ◆
-                        </Button>
-                      </Box>
-                    ) : (
-                      <Box
-                        key={`${agent.id}-${i}`}
-                        width={piece.cells}
-                        height={1}
-                        backgroundColor={piece.kind === 'bar' ? STATUS_THEME[statusOf(agent, t)] : undefined}
-                      />
-                    ),
-                  )}
-                </Box>
-              </Box>
-            )
-          })}
-          <Box flexDirection="row">
-            <Box width={labelColumns} />
-            <Text dimColor>{clock(t0)}</Text>
-            <Box flexGrow={1} />
-            <Text dimColor>now</Text>
-          </Box>
+        <Box flexDirection="row" gap={2}>
+          <Text bold>
+            {rest.length} agent{rest.length === 1 ? '' : 's'}
+          </Text>
+          {[...counts].map(([status, n]) => (
+            <Text color={STATUS_THEME[status]}>
+              ● {n} {status.toLowerCase()}
+            </Text>
+          ))}
+          <Box flexGrow={1} />
+          {subs.length > 0 && (
+            <Button key="zoom" plain onPress={() => update($, zoom, z => (z === 'agents' ? 'session' : 'agents'))}>
+              <Text dimColor>{fitAgents ? 'Show whole session' : 'Fit to agents'}</Text>
+            </Button>
+          )}
         </Box>
-        {hidden > 0 && <Text dimColor>{hidden} earlier finished agents not shown</Text>}
+        {attention.length > 0 && <Text color="warning">⚠ Needs attention: {attention.join(', ')}</Text>}
+
         <Box flexDirection="column">
           {shown.map(agent => {
             const status = statusOf(agent, t)
-            const isOpen = open.includes(agent.id)
-            const own = hooks.filter(hook => ownerOf(hook, all) === agent.id)
-            const blocked = own.filter(hook => hook.kind === 'blocked').length
-            const focusedHook = own.find(hook => hook.at === focus)
-            const focusedCall = focusedHook?.toolUseId
-            // The focused call stays in view even when it is older than the latest few.
-            const latest = agent.calls.slice(-SHOWN_CALLS)
-            const older = agent.calls.find(c => c.id === focusedCall && !latest.includes(c))
-            const hookLines = own.slice(-5)
-            if (focusedHook && !hookLines.includes(focusedHook)) hookLines.unshift(focusedHook)
+            const marks = marksOf(agent)
             return (
-              <Box key={agent.id} flexDirection="column">
-                <Box flexDirection="row" gap={1}>
+              <Box key={`agent-${agent.id}`} flexDirection="row" gap={1}>
+                <Box width={labelColumns} flexDirection="row" gap={1}>
                   <Text color={STATUS_THEME[status]}>●</Text>
-                  <Button key={agent.id} plain onPress={() => toggle(agent.id)}>
-                    {isOpen ? '▾' : '▸'} {agent.description}{' '}
-                    <Text dimColor>
-                      {status} · {duration(activeMs(agent))} active · {agent.callCount} calls{blocked > 0 ? ` · ${blocked} blocked` : ''}
-                    </Text>
+                  <Button key={agent.id} plain onPress={() => choose(agent.id)}>
+                    <Text bold={agent.id === chosen}>{shortLabel(agent.description)}</Text>
                   </Button>
                 </Box>
-                {isOpen && (
-                  <Box flexDirection="column" paddingLeft={3} gap={1}>
-                    {agent.type && agent.id !== MAIN && <Text dimColor>{agent.type} · started {clock(agent.startedAt)}</Text>}
-                    <Box flexDirection="column">
-                      {agent.calls.length === 0 && <Text dimColor>No tool calls yet.</Text>}
-                      {older && (
-                        <Text wrap="truncate-end" bold color="suggestion">
-                          → {older.endAt === undefined ? '…' : older.isError ? '✗' : '✓'} {clock(older.at)} {older.tool} {older.brief}
-                        </Text>
+                {Svg ? (
+                  <Box width={trackColumns}>
+                    <Svg
+                      source={trackSvg(
+                        track(agent, marks, t0, t1, t),
+                        STATUS_COLOR[status],
+                        `${agent.description}\n${status} · ${duration(activeMs(agent))} active · ${agent.callCount} calls`,
+                        trackColumns * CELL_PX,
                       )}
-                      {older && <Text dimColor>⋮</Text>}
-                      {latest.map(c => (
-                        <Text
-                          wrap="truncate-end"
-                          bold={c.id === focusedCall}
-                          color={c.id === focusedCall ? 'suggestion' : c.isError ? 'error' : undefined}
-                          dimColor={c.id !== focusedCall && c.endAt !== undefined && !c.isError}
-                        >
-                          {c.id === focusedCall ? '→ ' : ''}
-                          {c.endAt === undefined ? '…' : c.isError ? '✗' : '✓'} {clock(c.at)} {c.tool} {c.brief}
-                        </Text>
-                      ))}
-                    </Box>
-                    {hookLines.map(hook => (
-                      <Text color={hook.kind === 'blocked' ? 'error' : 'remember'} bold={hook === focusedHook} wrap="truncate-end">
-                        {hook === focusedHook ? '→ ' : ''}◆ {hook.event} hook {hook.kind} at {clock(hook.at)}: {hook.text.split('\n')[0]}
-                      </Text>
-                    ))}
-                    {agent.result && <Markdown key={`result-${agent.id}`} text={agent.result.slice(0, 1500)} />}
-                    {agent.id !== MAIN && (
-                      <Button key={`view-${agent.id}`} label="Open transcript" onPress={() => void $.ui.view({ agentId: agent.id })} />
+                      alt={`${agent.description}: ${status}`}
+                      width={trackColumns * CELL_PX}
+                      height={20}
+                      isInteractive
+                    />
+                  </Box>
+                ) : (
+                  <Box flexDirection="row" width={trackColumns}>
+                    {inCells(track(agent, marks, t0, t1, t), trackColumns).map((piece, i) =>
+                      piece.kind === 'mark' ? (
+                        stripe(piece)
+                      ) : piece.kind === 'bar' ? (
+                        <Box key={`${agent.id}-${i}`} width={piece.cells} height={1} flexDirection="row" backgroundColor={STATUS_THEME[status]}>
+                          {piece.marks.map((mark, j) => [
+                            <Box key={`${agent.id}-${i}-lead-${j}`} width={mark.offset - (piece.marks[j - 1]?.offset ?? -1) - 1} />,
+                            stripe(mark),
+                          ])}
+                        </Box>
+                      ) : (
+                        <Box key={`${agent.id}-${i}`} width={piece.cells} height={1} />
+                      ),
                     )}
                   </Box>
                 )}
+                <Box width={timeColumns}>
+                  <Text dimColor>{duration(activeMs(agent))}</Text>
+                </Box>
               </Box>
             )
           })}
+
+          <Box flexDirection="row" gap={1}>
+            <Box width={labelColumns} />
+            <Box flexDirection="row" width={trackColumns}>
+              <Text dimColor>{clock(t0)}</Text>
+              <Box flexGrow={1} />
+              <Text dimColor>{t1 >= t ? 'now' : clock(t1)}</Text>
+            </Box>
+            <Box width={timeColumns}>
+              <Text dimColor>active</Text>
+            </Box>
+          </Box>
         </Box>
+        {hidden > 0 && <Text dimColor>{hidden} earlier finished agents not shown</Text>}
+        {chosenAgent ? card(chosenAgent) : <Text dimColor>Click an agent's name for its details.</Text>}
       </Box>
     )
   })
