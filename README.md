@@ -33,7 +33,7 @@ The pane opens when a session starts; `/timeline` reopens it.
 
 ## Limits
 
-- Agents from before the mod loaded, or from a resumed session, are rebuilt from the session's transcripts under `~/.claude/projects` when the session starts. A transcript over 4 MiB (the most a mod can read at once) is skipped: in long sessions that is usually the main session's. Its row then shows as busy the moments it launched each subagent and each handed back, and has no tool calls from before the mod loaded; subagents still come in whole. The transcript format is not a documented Claude Code interface, so an update can break this part.
+- Agents from before the mod loaded, or from a resumed session, are rebuilt from the session's transcripts under `~/.claude/projects` when the session starts. A transcript over 4 MiB (the most a mod can read at once) is not read whole: in long sessions that is usually the main session's. For it the mod runs a small command (PowerShell on Windows, `sed` elsewhere) that prints only each entry's time, so its bars are complete but it has no tool calls from before the mod loaded. If that command fails, the row falls back to the moments it launched each subagent and each handed back. Subagents still come in whole. The transcript format is not a documented Claude Code interface, so an update can break this part.
 - No batch grouping, no file or diff viewer, no session list, no token counts (the skill has these).
 - Settings hooks that fail without blocking are not visible to it.
 - Mod hooks are an early-access Claude Code API and may change between releases.

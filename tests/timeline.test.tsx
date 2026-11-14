@@ -189,6 +189,96 @@ test('agents from before the mod loaded come back from the transcripts', async (
   await ui.unmount()
 })
 
+test("a main transcript too large to read gives its entries' times from a command", async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_100_000 })
+  const DIR = '/home/u/.claude/projects/-work/s1'
+  const norm = (path: string) => path.replace(/\\/g, '/').replace(/^[A-Za-z]:/, '')
+  on('command.register', () => ({ value: { command: 'timeline' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: 's1' }))
+  on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/home/u' : undefined }))
+  on('fs.exists', (_, e) => ({ value: norm(e.path) === `${DIR}.jsonl` }))
+  on('fs.stat', () => ({ value: { kind: 'file', size: 12_000_000, mtimeMs: 0, isLink: false } }))
+  on('fs.list', () => ({ value: [] }))
+  const ran: string[][] = []
+  on('process.run', (_, e) => {
+    ran.push([...e.argv])
+    const times = [0, 30, 60].map(s => new Date(1_700_000_000_000 + s * 1000).toISOString())
+    return { value: { exitCode: 0, stdout: `${times.join('\n')}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+  })
+
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+  await clock.advance(10)
+  expect(ran[0]?.[0]).toBe('sed')
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.press({ key: 'main' })
+  const started = new Date(1_700_000_000_000).toTimeString().slice(0, 8)
+  expect(await ui.find({ type: 'Text', text: new RegExp(`^Main session · .* started ${started}`) })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a session like a long resumed one renders in every view', async ($, on) => {
+  const NOW = 1_700_100_000_000
+  mock.clock(on, { now: NOW })
+  const day = NOW - 3 * 3600_000
+  const agents = Array.from({ length: 14 }, (_, i) => {
+    const start = day + i * 10 * 60_000
+    return {
+      id: `ag${i}`,
+      description: `Stage ${i} correctness review with a long name`,
+      type: 'general-purpose',
+      parentId: 'main',
+      startedAt: start,
+      lastAt: start + 8 * 60_000,
+      endedAt: start + 8 * 60_000,
+      ending: 'answer',
+      lastCleanAt: start + 8 * 60_000,
+      spans: [[start, start + 8 * 60_000]],
+      calls: [{ id: `t${i}`, tool: 'Bash', brief: 'grep -n "x" src/a.ts', at: start + 60_000, endAt: start + 61_000 }],
+      callCount: 30,
+      result: 'VERDICT: PASS\n\n- **B1** <fixed> & "done"',
+    }
+  })
+  const moments = agents.flatMap(a => [a.startedAt, a.lastAt])
+  const main = {
+    id: 'main',
+    description: 'Main session',
+    type: 'main',
+    startedAt: Math.min(...moments),
+    lastAt: NOW - 60_000,
+    endedAt: NOW - 60_000,
+    ending: 'answer',
+    lastCleanAt: 0,
+    spans: [[day, day + 150 * 60_000], [NOW - 120_000, NOW - 60_000]],
+    calls: [],
+    callCount: 2,
+  }
+  const hooks = agents.slice(0, 3).map((a, i) => ({
+    at: a.startedAt + 120_000,
+    event: 'PostToolUse',
+    kind: i === 0 ? 'blocked' : 'message',
+    text: `Contents of E:\\Github\\webstore3.0\\.claude\\worktrees\\agent-${i}\\AGENTS.md: <rules> & "quotes"\n${'x'.repeat(600)}`,
+    agentId: a.id,
+    toolUseId: `t${i}`,
+  }))
+  // Only the timeline is seeded; the view and selection keep the engine's own store.
+  on('state.get', (_, e, next) =>
+    e.key === 'timeline' ? { value: { value: { shape: 'timeline-1', value: { agents: [main, ...agents], hooks } }, version: 1 } } : next(e),
+  )
+
+  const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 90 }, surface: 'desktop' })
+  expect((await ui.find({ type: 'Text', text: /^14 agents$/ }))?.text).toBe('14 agents')
+  for (const key of ['view-session', 'view-recent', 'view-agents']) {
+    await ui.press({ key })
+    expect(await ui.find({ key: 'ag13' }), key).toBeDefined()
+  }
+  await ui.press({ key: 'ag0' })
+  expect(await ui.find({ type: 'Text', text: /PostToolUse blocked Contents of/ })).toBeDefined()
+  await ui.unmount()
+})
+
 test('a timeline an earlier version stored is declined', async ($, on) => {
   mock.clock(on, { now: 1_700_000_000_000 })
   on('state.get', () => ({ value: { value: { agents: [{ id: 'x' }] }, version: 1 } }))

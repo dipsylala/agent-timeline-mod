@@ -314,10 +314,37 @@ async function readSmall($: EngineInterface, path: string): Promise<string | und
   return $.fs.read(path).catch(() => undefined)
 }
 
+// Each transcript line's own time is its last "timestamp" field: Claude Code
+// writes it after the message, which may quote other timestamps. A plain
+// last-index search, as a regex on multi-megabyte lines is slow.
+const TIMES_PS = [
+  '$r = [IO.StreamReader]::new($env:AGENT_TIMELINE_FILE); $k = \'"timestamp":"\'',
+  'while ($null -ne ($l = $r.ReadLine())) { $i = $l.LastIndexOf($k); if ($i -ge 0) { $s = $i + $k.Length; $e = $l.IndexOf(\'"\', $s); if ($e -gt $s) { $l.Substring($s, $e - $s) } } }',
+  '$r.Close()',
+].join('; ')
+
+/**
+ * The time of every entry in a transcript too large for `$.fs.read`, read by
+ * a command (PowerShell on Windows, sed elsewhere) that prints only those;
+ * empty when the command is missing or fails.
+ */
+async function entryTimes($: EngineInterface, path: string): Promise<number[]> {
+  const isWindows = (await $.env.get('OS')) === 'Windows_NT'
+  const argv = isWindows
+    ? ['powershell', '-NoProfile', '-NonInteractive', '-Command', TIMES_PS]
+    : ['sed', '-n', 's/.*"timestamp":"\\([^"]*\\)".*/\\1/p', path]
+  const run = await $.process.run(argv, { env: { AGENT_TIMELINE_FILE: path }, timeoutMs: 60_000 }).catch(() => undefined)
+  if (!run || run.exitCode !== 0) return []
+  return run.stdout
+    .split('\n')
+    .map(line => Date.parse(line.trim()))
+    .filter(at => !Number.isNaN(at))
+}
+
 /**
  * Adds what the transcripts hold that the live rows do not: agents from
  * before the mod loaded or from a resumed session, and their hook blocks.
- * A main transcript over the read limit is skipped; subagents still come in.
+ * A main transcript over the read limit gives its entries' times alone.
  */
 async function backfill($: EngineInterface, cwd: string) {
   const dir = await sessionDir($, cwd)
@@ -340,11 +367,13 @@ async function backfill($: EngineInterface, cwd: string) {
     const parsed = parseTranscript(text, base, { finished: meta.finished })
     if (parsed) found.push({ ...parsed, isMain: false })
   }
-  if (!main && found.length > 0) {
-    // The main transcript is too large to read. The main session was busy when
-    // it launched each subagent and when each handed back, so those moments
-    // stand in for its own activity.
-    const moments = found.flatMap(({ agent }) => [agent.startedAt, agent.lastAt])
+  if (!main) {
+    // The main transcript is too large to read whole. Its entries' times come
+    // from a small command; failing that, the main session was at least busy
+    // when it launched each subagent and when each handed back.
+    const times = await entryTimes($, `${dir}.jsonl`)
+    const moments = times.length > 0 ? times : found.flatMap(({ agent }) => [agent.startedAt, agent.lastAt])
+    if (moments.length === 0) return
     const spans = mergeSpans(moments.map((at): [number, number] => [at, at]))
     found.push({
       agent: {
