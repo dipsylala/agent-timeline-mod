@@ -25,9 +25,6 @@ const timeline = atom({ plugin: 'agent-timeline', key: 'timeline' } as const, EM
 const now = atom({ plugin: 'agent-timeline', key: 'now' } as const, 0)
 // The agent whose details show below the list; '' for none.
 const selected = atom({ plugin: 'agent-timeline', key: 'selected' } as const, '')
-// The chart's window: the subagents' activity, the whole session, or the last 30 minutes.
-const zoom = atom({ plugin: 'agent-timeline', key: 'zoom' } as const, 'agents' as 'agents' | 'session' | 'recent')
-const RECENT = 30 * 60_000 // the "Last 30 min" view
 
 function newAgent(id: string, t: number, description: string, type: string, parentId?: string): Agent {
   const agent: Agent = { id, description, type, parentId, startedAt: t, lastAt: t, lastCleanAt: 0, spans: [[t, t]], calls: [], callCount: 0 }
@@ -314,114 +311,59 @@ async function readSmall($: EngineInterface, path: string): Promise<string | und
   return $.fs.read(path).catch(() => undefined)
 }
 
-// For a transcript too large for `$.fs.read`, a command prints a summary the
-// mod can take in: `T <time>` for each line (its last "timestamp" field, as
-// Claude Code writes the entry's own time after the message, which may quote
-// others), `U <id>` for each tool call, then `<<TAIL>>` and the file's last
-// TAIL bytes, which hold the latest calls, reply and hook blocks. Plain index
-// searches, as a regex on multi-megabyte lines is slow.
+// The chart covers what the main transcript's last TAIL bytes cover: enough
+// for the recent work, and within what one read or one command's output can
+// hold. A file larger than `$.fs.read` takes comes from a command that prints
+// only those bytes.
 const TAIL = 2_500_000
-const TAIL_MARK = '<<TAIL>>'
-const SUMMARY_PS = [
-  '$o = [Console]::Out; [Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)',
-  `$p = $env:AGENT_TIMELINE_FILE; $k = '"timestamp":"'; $u = '"type":"tool_use","id":"'`,
-  '$r = [IO.StreamReader]::new($p)',
-  'while ($null -ne ($l = $r.ReadLine())) {' +
-    ' $i = $l.LastIndexOf($k); if ($i -ge 0) { $s = $i + $k.Length; $e = $l.IndexOf(\'"\', $s); if ($e -gt $s) { $o.WriteLine(\'T \' + $l.Substring($s, $e - $s)) } }' +
-    ' $j = $l.IndexOf($u); while ($j -ge 0) { $s = $j + $u.Length; $e = $l.IndexOf(\'"\', $s); if ($e -le $s) { break }; $o.WriteLine(\'U \' + $l.Substring($s, $e - $s)); $j = $l.IndexOf($u, $e) }' +
-    ' }',
-  '$r.Close()',
-  `$o.WriteLine('${TAIL_MARK}')`,
-  `$f = [IO.File]::OpenRead($p); $n = [Math]::Min($f.Length, ${TAIL}); [void]$f.Seek(-$n, 'End')`,
+const TAIL_PS = [
+  '[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)',
+  `$f = [IO.File]::OpenRead($env:AGENT_TIMELINE_FILE); $n = [Math]::Min($f.Length, ${TAIL}); [void]$f.Seek(-$n, 'End')`,
   '$b = New-Object byte[] $n; $got = 0; while ($got -lt $n) { $got += $f.Read($b, $got, $n - $got) }; $f.Close()',
-  '$o.Write([Text.Encoding]::UTF8.GetString($b)); $o.Flush()',
+  '[Console]::Out.Write([Text.Encoding]::UTF8.GetString($b)); [Console]::Out.Flush()',
 ].join('; ')
 
-type LargeTranscript = { times: number[]; callIds: Set<string>; tail: string }
-
 /**
- * The summary of a transcript too large to read whole: PowerShell on Windows,
- * sed, grep and tail elsewhere. Undefined when the commands are missing or fail.
+ * The last TAIL bytes of a transcript, from its first whole line: by one read
+ * when the file is small enough, else PowerShell on Windows or tail
+ * elsewhere. Undefined when it cannot be read.
  */
-async function readLarge($: EngineInterface, path: string, size: number): Promise<LargeTranscript | undefined> {
-  const init = { env: { AGENT_TIMELINE_FILE: path }, timeoutMs: 60_000 }
-  const run = (argv: string[]) => $.process.run(argv, init).catch(() => undefined)
-  let summary: string
-  let tail: string
-  if ((await $.env.get('OS')) === 'Windows_NT') {
-    const out = await run(['powershell', '-NoProfile', '-NonInteractive', '-Command', SUMMARY_PS])
-    if (!out || out.exitCode !== 0) return undefined
-    // WriteLine ends lines with \r\n on Windows.
-    const cut = out.stdout.search(new RegExp(`${TAIL_MARK}\\r?\\n`))
-    if (cut < 0) return undefined
-    summary = out.stdout.slice(0, cut)
-    tail = out.stdout.slice(out.stdout.indexOf('\n', cut) + 1)
+async function readTail($: EngineInterface, path: string, size: number): Promise<string | undefined> {
+  let text: string | undefined
+  if (size <= MAX_READ) {
+    text = await $.fs.read(path).catch(() => undefined)
+    // Characters, not bytes, but near enough to place the window.
+    if (text !== undefined && size > TAIL) text = text.slice(-TAIL)
   } else {
-    const times = await run(['sed', '-n', 's/.*"timestamp":"\\([^"]*\\)".*/T \\1/p', path])
-    // grep exits 1 when nothing matches: no calls, not a failure.
-    const ids = await run(['grep', '-o', '"type":"tool_use","id":"[^"]*"', path])
-    const end = await run(['tail', '-c', String(TAIL), path])
-    if (times?.exitCode !== 0 || !ids || ids.exitCode > 1 || end?.exitCode !== 0) return undefined
-    summary = `${times.stdout}\n${ids.stdout.replace(/^"type":"tool_use","id":"([^"]*)"$/gm, 'U $1')}`
-    tail = end.stdout
+    const isWindows = (await $.env.get('OS')) === 'Windows_NT'
+    const argv = isWindows ? ['powershell', '-NoProfile', '-NonInteractive', '-Command', TAIL_PS] : ['tail', '-c', String(TAIL), path]
+    const run = await $.process.run(argv, { env: { AGENT_TIMELINE_FILE: path }, timeoutMs: 60_000 }).catch(() => undefined)
+    text = run?.exitCode === 0 ? run.stdout : undefined
   }
-  const times: number[] = []
-  const callIds = new Set<string>()
-  for (const line of summary.split(/\r?\n/)) {
-    if (line.startsWith('T ')) {
-      const at = Date.parse(line.slice(2))
-      if (!Number.isNaN(at)) times.push(at)
-    } else if (line.startsWith('U ')) callIds.add(line.slice(2))
-  }
-  // The tail starts mid-line unless it is the whole file.
-  return { times, callIds, tail: size > TAIL ? tail.slice(tail.indexOf('\n') + 1) : tail }
+  // A cut file starts mid-line.
+  return text !== undefined && size > TAIL ? text.slice(text.indexOf('\n') + 1) : text
 }
 
 function megabytes(bytes: number): string {
   return `${(bytes / 1e6).toFixed(bytes < 10e6 ? 1 : 0)} MB`
 }
 
-/** The main session's row from a transcript too large to read whole. */
-function largeMain(large: LargeTranscript, size: number): { agent: Agent; hooks: HookMark[] } | undefined {
-  const recent = parseTranscript(large.tail, { id: MAIN, description: 'Main session', type: 'main' }, { isMain: true })
-  // Bars and the call count cover the whole transcript; hook events only its tail.
-  const since = recent ? `, since ${clock(recent.agent.startedAt)}` : ''
-  const note = size > TAIL ? `Transcript too large to read whole (${megabytes(size)}): hook events from its last ${megabytes(TAIL)} only${since}.` : undefined
-  if (large.times.length === 0) return recent && { ...recent, agent: { ...recent.agent, note } }
-  const agent: Agent = {
-    id: MAIN,
-    description: 'Main session',
-    type: 'main',
-    startedAt: Math.min(...large.times),
-    lastAt: Math.max(...large.times),
-    lastCleanAt: recent?.agent.lastCleanAt ?? 0,
-    spans: mergeSpans(large.times.map((at): [number, number] => [at, at])),
-    calls: recent?.agent.calls ?? [],
-    callCount: Math.max(large.callIds.size, recent?.agent.callCount ?? 0),
-    result: recent?.agent.result,
-    note,
-  }
-  return { agent, hooks: recent?.hooks ?? [] }
-}
-
 /**
  * Adds what the transcripts hold that the live rows do not: agents from
  * before the mod loaded or from a resumed session, and their hook blocks.
- * A main transcript over the read limit comes from a command's summary.
+ * The main transcript is read from its last TAIL bytes, whose first entry
+ * starts the chart's window.
  */
 async function backfill($: EngineInterface, cwd: string) {
   const dir = await sessionDir($, cwd)
   if (!dir) return
   const found: { agent: Agent; hooks: HookMark[]; isMain: boolean }[] = []
   const mainPath = `${dir}.jsonl`
-  const mainText = await readSmall($, mainPath)
-  let main = mainText ? parseTranscript(mainText, { id: MAIN, description: 'Main session', type: 'main' }, { isMain: true }) : undefined
-  const mainSize = mainText ? 0 : ((await $.fs.stat(mainPath).catch(() => undefined))?.size ?? 0)
-  if (mainSize > 0) {
-    const large = await readLarge($, mainPath, mainSize)
-    main = large ? largeMain(large, mainSize) : undefined
-  }
+  const mainSize = (await $.fs.stat(mainPath).catch(() => undefined))?.size ?? 0
+  const tail = mainSize > 0 ? await readTail($, mainPath, mainSize) : undefined
+  const main = tail ? parseTranscript(tail, { id: MAIN, description: 'Main session', type: 'main' }, { isMain: true }) : undefined
   if (main) found.push({ ...main, isMain: true })
+  const window = main && mainSize > TAIL ? { since: main.agent.startedAt, transcriptBytes: mainSize } : {}
   const folder = `${dir}/subagents`
   for (const entry of await $.fs.list(folder).catch(() => [])) {
     const id = /^agent-(.+)\.jsonl$/.exec(entry.name)?.[1]
@@ -437,7 +379,7 @@ async function backfill($: EngineInterface, cwd: string) {
     if (parsed) found.push({ ...parsed, isMain: false })
   }
   if (!main && found.length > 0) {
-    // No summary of the main transcript either: the main session was at least
+    // The main transcript could not be read: the main session was at least
     // busy when it launched each subagent and when each handed back.
     const moments = found.flatMap(({ agent }) => [agent.startedAt, agent.lastAt])
     found.push({
@@ -453,7 +395,7 @@ async function backfill($: EngineInterface, cwd: string) {
         callCount: 0,
         note:
           mainSize > 0
-            ? `Transcript too large to read (${megabytes(mainSize)}): bars show only when subagents started and finished; earlier calls aren't listed.`
+            ? `Transcript could not be read (${megabytes(mainSize)}): bars show only when subagents started and finished; earlier calls aren't listed.`
             : undefined,
       },
       hooks: [],
@@ -472,7 +414,7 @@ async function backfill($: EngineInterface, cwd: string) {
     }
     // Main first, then by when each agent started.
     agents = [...agents].sort((a, b) => (a.id === MAIN ? -1 : b.id === MAIN ? 1 : a.startedAt - b.startedAt))
-    return { agents, hooks: [...hooks].sort((a, b) => a.at - b.at).slice(-KEEP_HOOKS) }
+    return { ...tl, ...window, agents, hooks: [...hooks].sort((a, b) => a.at - b.at).slice(-KEEP_HOOKS) }
   })
 }
 
@@ -584,40 +526,28 @@ export const register: Register = on => {
     const { Box, Text, Button, Markdown } = ui
     // The terminal's table carries an Svg at run time that draws nothing there.
     const Svg = e.surface !== 'terminal' && 'Svg' in ui ? ui.Svg : undefined
-    const { agents: all, hooks } = await read($, timeline)
+    const { agents: all, hooks, since, transcriptBytes } = await read($, timeline)
     const chosen = await read($, selected)
-    const view = await read($, zoom)
     const t = Math.max(await read($, now), await $.clock.now())
 
     if (all.length === 0) return <Text dimColor>No activity yet.</Text>
 
-    // Main first, then the latest subagents; unfinished ones always stay.
+    // The window runs to now from where the main transcript's last TAIL bytes
+    // start, or from the session's start when it was read whole.
+    const t0 = since ?? Math.min(...all.map(a => a.startedAt))
+    const t1 = t
+    // Main first, then the latest subagents active in the window; unfinished
+    // ones always stay.
     const main = all.filter(a => a.id === MAIN)
-    const rest = all.filter(a => a.id !== MAIN)
-    const unfinished = rest.filter(a => a.endedAt === undefined)
-    const finished = rest.filter(a => a.endedAt !== undefined).slice(-Math.max(0, SHOWN_ROWS - 1 - unfinished.length))
-    const shown = [...main, ...rest.filter(a => unfinished.includes(a) || finished.includes(a))]
+    const inWindow = all.filter(a => a.id !== MAIN && (a.endedAt === undefined || a.lastAt >= t0))
+    const unfinished = inWindow.filter(a => a.endedAt === undefined)
+    const finished = inWindow.filter(a => a.endedAt !== undefined).slice(-Math.max(0, SHOWN_ROWS - 1 - unfinished.length))
+    const subs = inWindow.filter(a => unfinished.includes(a) || finished.includes(a))
+    const shown = [...main, ...subs]
     const hidden = all.length - shown.length
 
-    // The window: the last 30 minutes, the subagents' own activity with a
-    // margin, or the whole session. Agents falls back to the whole session
-    // while there are no subagents.
-    const subs = shown.filter(a => a.id !== MAIN)
-    const isFitted = view === 'agents' && subs.length > 0
-    const first = view === 'recent' ? t - RECENT : Math.min(...(isFitted ? subs : shown).map(a => a.startedAt))
-    const last = isFitted && subs.every(a => a.endedAt !== undefined) ? Math.max(...subs.map(a => a.lastAt)) : t
-    const margin = isFitted ? Math.max((last - first) * 0.05, 1000) : 0
-    const t0 = first - margin
-    const t1 = Math.min(t, last + margin)
-    const views = [
-      { id: 'session', label: 'Whole session' },
-      ...(subs.length > 0 ? [{ id: 'agents', label: 'Agents' }] : []),
-      { id: 'recent', label: 'Last 30 min' },
-    ] as const
-    const current = view === 'agents' && !isFitted ? 'session' : view
-
     const counts = new Map<Status, number>()
-    for (const agent of rest) counts.set(statusOf(agent, t), (counts.get(statusOf(agent, t)) ?? 0) + 1)
+    for (const agent of subs) counts.set(statusOf(agent, t), (counts.get(statusOf(agent, t)) ?? 0) + 1)
     const attention = needsAttention(all, hooks, t)
     const labelColumns = Math.max(14, Math.min(30, Math.floor(e.props.bodyColumns * 0.32)))
     const timeColumns = 8
@@ -729,22 +659,19 @@ export const register: Register = on => {
       <Box flexDirection="column" gap={1}>
         <Box flexDirection="row" gap={2}>
           <Text bold>
-            {rest.length} agent{rest.length === 1 ? '' : 's'}
+            {subs.length} agent{subs.length === 1 ? '' : 's'}
           </Text>
           {[...counts].map(([status, n]) => (
             <Text color={STATUS_THEME[status]}>
               ● {n} {status.toLowerCase()}
             </Text>
           ))}
-          <Box flexGrow={1} />
-          {views.map(option => (
-            <Button key={`view-${option.id}`} plain onPress={() => update($, zoom, () => option.id)}>
-              <Text bold={option.id === current} dimColor={option.id !== current}>
-                {option.label}
-              </Text>
-            </Button>
-          ))}
         </Box>
+        {since !== undefined && transcriptBytes !== undefined && (
+          <Text dimColor>
+            Since {clock(since)}: the last {megabytes(TAIL)} of a {megabytes(transcriptBytes)} transcript.
+          </Text>
+        )}
         {attention.length > 0 && <Text color="warning">⚠ Needs attention: {attention.join(', ')}</Text>}
 
         <Box flexDirection="column">
@@ -811,7 +738,11 @@ export const register: Register = on => {
             </Box>
           </Box>
         </Box>
-        {hidden > 0 && <Text dimColor>{hidden} earlier finished agents not shown</Text>}
+        {hidden > 0 && (
+          <Text dimColor>
+            {hidden} earlier agent{hidden === 1 ? '' : 's'} not shown
+          </Text>
+        )}
         {chosenAgent ? card(chosenAgent) : <Text dimColor>Click an agent's name for its details.</Text>}
       </Box>
     )

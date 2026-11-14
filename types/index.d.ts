@@ -41,7 +41,14 @@ export type Agent = {
   note?: string
 }
 
-export type Timeline = { agents: Agent[]; hooks: HookMark[] }
+export type Timeline = {
+  agents: Agent[]
+  hooks: HookMark[]
+  /** Where the chart starts when the main transcript was read from its tail only. */
+  since?: number
+  /** That transcript's size, for saying what the window covers. */
+  transcriptBytes?: number
+}
 
 declare module 'claude-code' {
   interface PluginState {
@@ -50,8 +57,6 @@ declare module 'claude-code' {
       now: number
       /** The agent whose details show below the list; '' for none. */
       selected: string
-      /** The chart's window: the subagents' activity, the whole session, or the last 30 minutes. */
-      zoom: 'agents' | 'session' | 'recent'
     }
   }
 }

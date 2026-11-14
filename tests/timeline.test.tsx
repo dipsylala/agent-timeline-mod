@@ -181,66 +181,73 @@ test('agents from before the mod loaded come back from the transcripts', async (
   await ui.press({ key: 'main' })
   const started = new Date(1_700_000_000_000).toTimeString().slice(0, 8)
   expect(await ui.find({ type: 'Text', text: new RegExp(`^Main session · .* started ${started}`) }), 'main start').toBeDefined()
-  // No summary command answered here, so the note says how little the bars cover.
-  expect(await ui.find({ type: 'Text', text: /^Transcript too large to read \(12 MB\): bars show only when subagents started/ }), 'note').toBeDefined()
-
-  // Three views of the chart's window.
-  for (const key of ['view-session', 'view-agents', 'view-recent']) expect(await ui.find({ key }), key).toBeDefined()
-  await ui.press({ key: 'view-recent' })
-  expect(await ui.find({ type: 'Text', text: new RegExp(`^${new Date(1_700_000_100_010 - 30 * 60_000).toTimeString().slice(0, 5)}`) }), 'recent axis').toBeDefined()
+  // The main transcript could not be read here, so the note says how little the bars cover.
+  expect(await ui.find({ type: 'Text', text: /^Transcript could not be read \(12 MB\): bars show only when subagents started/ }), 'note').toBeDefined()
   await ui.unmount()
 })
 
-test('a main transcript too large to read comes from a summary: times, call count, latest calls and reply', async ($, on) => {
+test("a main transcript over the read limit is read from its last 2.5 MB, which sets the chart's window", async ($, on) => {
   const clock = mock.clock(on, { now: 1_700_000_100_000 })
+  const at = (s: number) => new Date(1_700_000_000_000 + s * 1000).toISOString()
   const DIR = '/home/u/.claude/projects/-work/s1'
   const norm = (path: string) => path.replace(/\\/g, '/').replace(/^[A-Za-z]:/, '')
+  // A subagent that finished an hour before the window starts.
+  const files: Record<string, string> = {
+    [`${DIR}/subagents/agent-early.jsonl`]: [
+      { timestamp: at(-3600), type: 'user', message: { content: 'Early task' } },
+      { timestamp: at(-3500), type: 'assistant', message: { content: [{ type: 'text', text: 'Done early.' }] } },
+    ]
+      .map(line => JSON.stringify(line))
+      .join('\n'),
+    [`${DIR}/subagents/agent-early.meta.json`]: JSON.stringify({ description: 'Early task', agentType: 'Explore', finished: true }),
+  }
   on('command.register', () => ({ value: { command: 'timeline' } }))
   on('ui.open', () => ({ value: { isPlaced: true } }))
   on('session.start', (_, e) => ({ cwd: e.cwd }))
   on('session.id', () => ({ value: 's1' }))
   on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/home/u' : undefined }))
   on('fs.exists', (_, e) => ({ value: norm(e.path) === `${DIR}.jsonl` }))
-  on('fs.stat', () => ({ value: { kind: 'file', size: 12_000_000, mtimeMs: 0, isLink: false } }))
-  on('fs.list', () => ({ value: [] }))
-  const at = (s: number) => new Date(1_700_000_000_000 + s * 1000).toISOString()
-  // What sed, grep and tail print for the transcript (not Windows, as OS is unset here).
-  const outputs: Record<string, string> = {
-    sed: [0, 30, 60].map(s => `T ${at(s)}`).join('\n'),
-    grep: ['toolu_a', 'toolu_b', 'toolu_c'].map(id => `"type":"tool_use","id":"${id}"`).join('\n'),
-    tail: [
-      'id":"cut mid-line by tail"}',
-      JSON.stringify({ timestamp: at(50), type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_c', name: 'Bash', input: { command: 'npm test' } }] } }),
-      JSON.stringify({ timestamp: at(55), type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_c', content: 'ok' }] } }),
-      JSON.stringify({ timestamp: at(60), type: 'assistant', message: { content: [{ type: 'text', text: 'Tests pass.' }] } }),
-    ].join('\n'),
-  }
+  on('fs.stat', (_, e) => ({ value: { kind: 'file', size: norm(e.path) === `${DIR}.jsonl` ? 12_000_000 : 1000, mtimeMs: 0, isLink: false } }))
+  on('fs.list', (_, e) =>
+    norm(e.path) === `${DIR}/subagents`
+      ? { value: Object.keys(files).map(path => ({ name: path.split('/').pop() ?? '', kind: 'file', size: 1000, mtimeMs: 0, isLink: false })) }
+      : { value: [] },
+  )
+  on('fs.read', (_, e) => {
+    const text = files[norm(e.path)]
+    if (text === undefined) throw new Error(`ENOENT ${e.path}`)
+    return { value: text }
+  })
+  // What tail prints for the transcript (not Windows, as OS is unset here): it starts mid-line.
+  const tail = [
+    'id":"cut mid-line by tail"}',
+    JSON.stringify({ timestamp: at(50), type: 'assistant', message: { content: [{ type: 'tool_use', id: 'toolu_c', name: 'Bash', input: { command: 'npm test' } }] } }),
+    JSON.stringify({ timestamp: at(55), type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_c', content: 'ok' }] } }),
+    JSON.stringify({ timestamp: at(60), type: 'assistant', message: { content: [{ type: 'text', text: 'Tests pass.' }] } }),
+  ].join('\n')
   const ran: string[] = []
   on('process.run', (_, e) => {
-    const command = e.argv[0] ?? ''
-    ran.push(command)
-    return { value: { exitCode: 0, stdout: `${outputs[command] ?? ''}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
+    ran.push(e.argv.join(' '))
+    return { value: { exitCode: 0, stdout: `${tail}\n`, stderr: '', isStdoutTruncated: false, isStderrTruncated: false } }
   })
 
   await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
   await clock.advance(10)
-  expect(ran).toEqual(['sed', 'grep', 'tail'])
+  expect(ran[0]).toMatch(/^tail -c 2500000 /)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const since = new Date(1_700_000_050_000).toTimeString().slice(0, 8)
+  expect((await ui.find({ type: 'Text', text: /^Since / }))?.text, 'window').toBe(`Since ${since}: the last 2.5 MB of a 12 MB transcript.`)
+  expect(await ui.find({ key: 'early' }), 'agent before the window').toBeUndefined()
+  expect((await ui.find({ type: 'Text', text: /earlier agent/ }))?.text).toBe('1 earlier agent not shown')
   await ui.press({ key: 'main' })
-  const started = new Date(1_700_000_000_000).toTimeString().slice(0, 8)
-  expect(await ui.find({ type: 'Text', text: new RegExp(`^Main session · .* started ${started} · 3 calls`) }), 'header').toBeDefined()
+  expect(await ui.find({ type: 'Text', text: new RegExp(`^Main session · .* started ${since} · 1 call$`) }), 'header').toBeDefined()
   expect((await ui.find({ type: 'Text', text: /Bash npm test/ }))?.text, 'latest call').toMatch(/^✓/)
   expect(await ui.find({ type: 'Markdown', text: /Tests pass\./ }), 'latest reply').toBeDefined()
-  const since = new Date(1_700_000_050_000).toTimeString().slice(0, 8)
-  expect(
-    (await ui.find({ type: 'Text', text: /^Transcript too large/ }))?.text,
-    'note',
-  ).toBe(`Transcript too large to read whole (12 MB): hook events from its last 2.5 MB only, since ${since}.`)
   await ui.unmount()
 })
 
-test('a session like a long resumed one renders in every view', async ($, on) => {
+test('a session like a long resumed one renders', async ($, on) => {
   const NOW = 1_700_100_000_000
   mock.clock(on, { now: NOW })
   const day = NOW - 3 * 3600_000
@@ -291,10 +298,7 @@ test('a session like a long resumed one renders in every view', async ($, on) =>
 
   const ui = await $.ui.mount({ ...PANE, props: { ...PANE.props, bodyColumns: 90 }, surface: 'desktop' })
   expect((await ui.find({ type: 'Text', text: /^14 agents$/ }))?.text).toBe('14 agents')
-  for (const key of ['view-session', 'view-recent', 'view-agents']) {
-    await ui.press({ key })
-    expect(await ui.find({ key: 'ag13' }), key).toBeDefined()
-  }
+  expect(await ui.find({ key: 'ag13' })).toBeDefined()
   await ui.press({ key: 'ag0' })
   expect(await ui.find({ type: 'Text', text: /PostToolUse blocked Contents of/ })).toBeDefined()
   await ui.unmount()
