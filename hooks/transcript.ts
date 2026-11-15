@@ -11,13 +11,27 @@ const TOOL_ID = /toolu_[A-Za-z0-9]+/ // a hook's toolUseID can carry a suffix
 // How the engine reports a hook that blocked a tool call in the call's result.
 const HOOK_ERROR = /^(\w+)(?::\S+)? hook error: ([\s\S]*)$/
 
-/** One line saying what a tool call did, e.g. the command or the file it touched. */
+// Credentials a command line or URL can carry, masked before a brief is stored.
+const SECRETS: [RegExp, string][] = [
+  [/\b(authorization:\s*(?:bearer|basic|token)\s+)[^\s"']+/gi, '$1***'],
+  [/\b(bearer\s+)[A-Za-z0-9._~+/=-]{8,}/gi, '$1***'],
+  [/\b(\w*(?:key|token|secret|password|passwd|credential)\w*\s*=\s*)("[^"]*"|'[^']*'|[^\s"']+)/gi, '$1***'],
+  [/(--?(?:password|passwd|token|api[-_]?key|secret)[=\s]+)("[^"]*"|'[^']*'|[^\s"']+)/gi, '$1***'],
+  [/(\b[a-z][a-z0-9+.-]*:\/\/[^\s/:@]+:)[^\s/@]+@/gi, '$1***@'],
+  [/\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w{20,}|xox[abprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|AIza[0-9A-Za-z_-]{30,})/g, '***'],
+]
+
+export function redact(text: string): string {
+  return SECRETS.reduce((out, [pattern, to]) => out.replace(pattern, to), text)
+}
+
+/** One line saying what a tool call did, e.g. the command or the file it touched; credentials masked. */
 export function brief(input: object): string {
   const fields = input as Record<string, unknown>
   for (const key of BRIEF_KEYS) {
     const value = fields[key]
     if (typeof value === 'string' && value.trim()) {
-      return (value.trim().split('\n')[0] ?? '').replace(/^cd\s+\S+\s*&&\s*/, '').slice(0, 160)
+      return redact((value.trim().split('\n')[0] ?? '').replace(/^cd\s+\S+\s*&&\s*/, '')).slice(0, 160)
     }
   }
   return ''

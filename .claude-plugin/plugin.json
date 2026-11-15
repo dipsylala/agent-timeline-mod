@@ -1,6 +1,6 @@
 {
   "name": "agent-timeline",
-  "version": "0.9.1",
+  "version": "0.10.0",
   "description": "A pane beside the chat showing this session's subagents, their status, recent tool calls, results, and the hooks that blocked them",
   "types": "./types/index.d.ts"
 }

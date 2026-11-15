@@ -14,6 +14,7 @@ const MAIN = 'main'
 const RUNNING_WINDOW = 120_000 // unfinished and active this recently: Running
 const STALL_AFTER = 600_000 // unfinished and silent this long: Stalled
 const ATTENTION_WINDOW = 15 * 60_000 // hook blocks this recent count as needing attention
+const ASK_GRACE = 10_000 // a permission ask unsettled this long is waiting on a person, not the classifier
 
 const KEEP_HOOKS = 200
 const SHOWN_ROWS = 30
@@ -139,10 +140,16 @@ function ownerOf(hook: HookMark, agents: Agent[]): string {
   return MAIN
 }
 
-/** Stalled agents, and agents a hook blocked recently with no clean tool call since. */
+/** Whether a call has waited on a permission decision longer than the classifier takes. */
+function isAwaitingApproval(call: Call, t: number): boolean {
+  return call.askedAt !== undefined && call.endAt === undefined && t - call.askedAt >= ASK_GRACE
+}
+
+/** Agents waiting on a permission decision, stalled agents, and agents a hook blocked recently with no clean tool call since. */
 function needsAttention(agents: Agent[], hooks: HookMark[], t: number): string[] {
   const names = new Set<string>()
   for (const agent of agents) {
+    if (agent.calls.some(c => isAwaitingApproval(c, t))) names.add(`${agent.description} (waiting for approval)`)
     if (statusOf(agent, t) === 'Stalled') names.add(`${agent.description} (stalled)`)
   }
   for (const hook of hooks) {
@@ -487,9 +494,20 @@ export const register: Register = on => {
     return next(e)
   })
 
+  on('session.end', async ($, e, next) => {
+    // A /clear goes on under a new session id with no session.start: start the chart afresh.
+    if (e.reason === 'clear') {
+      layers.clear()
+      await update($, timeline, () => EMPTY)
+      await update($, selected, () => '')
+      await edit($, MAIN, await $.clock.now())
+    }
+    return next(e)
+  })
+
   on('command.run', { command: 'agent-timeline-pane' }, async $ => {
-    await $.ui.open({ id: PANE, title: TITLE })
-    return { text: 'Agent timeline pane opened.' }
+    const opened = await $.ui.open({ id: PANE, title: TITLE })
+    return { text: opened.isPlaced ? 'Agent timeline pane opened.' : `Agent timeline pane is not shown yet: ${opened.reason}` }
   })
 
   on('agent.spawn', async ($, e, next) => {
@@ -532,6 +550,21 @@ export const register: Register = on => {
       calls: a.calls.map(c => (c.id === call.id ? { ...c, endAt: end, isError: failed } : c)),
     }))
     return ran
+  })
+
+  // An "ask" puts the call to the mode's decider: a person, or the auto-mode
+  // classifier. It waits until its tool.call settles.
+  on('tool.check', async ($, e, next) => {
+    const verdict = await next(e)
+    const id = e.tool_use_id
+    if (verdict.decision === 'ask' && id) {
+      const t = await $.clock.now()
+      await update($, timeline, tl => ({
+        ...tl,
+        agents: tl.agents.map(a => (a.calls.some(c => c.id === id) ? { ...a, calls: a.calls.map(c => (c.id === id ? { ...c, askedAt: t } : c)) } : a)),
+      }))
+    }
+    return verdict
   })
 
   // Hooks modules sit above the settings hooks, so `next` answers with what
@@ -669,7 +702,11 @@ export const register: Register = on => {
               <Box key={`call-${agent.id}-${c.id}`} flexDirection="column">
                 {older.length > 0 && i === older.length && <Text dimColor>⋮</Text>}
                 <Text wrap="truncate-end">
-                  <Text color={c.isError ? 'error' : 'success'}>{c.endAt === undefined ? '…' : c.isError ? '✗' : '✓'}</Text>{' '}
+                  {c.endAt === undefined && c.askedAt !== undefined ? (
+                    <Text color="warning">?</Text>
+                  ) : (
+                    <Text color={c.isError ? 'error' : 'success'}>{c.endAt === undefined ? '…' : c.isError ? '✗' : '✓'}</Text>
+                  )}{' '}
                   <Text dimColor>{clock(c.at)}</Text> <Text color={c.isError ? 'error' : undefined}>{c.tool}</Text>{' '}
                   <Text dimColor>{c.brief}</Text>
                 </Text>
@@ -824,5 +861,13 @@ export const register: Register = on => {
     // Redraw without the old layers once the new ones have had time to load.
     if (isSettling) $.clock.after(SETTLE_MS, () => void update($, settle, n => n + 1))
     return view
+  }).catch(($, e, next) => {
+    // Without this a failed draw leaves the pane empty.
+    const { Text } = $.ui.resolve(e)
+    return (
+      <Text color="error" wrap="wrap">
+        Draw failed ({next.error.kind}): {next.error.message ?? 'no message'}
+      </Text>
+    )
   })
 }

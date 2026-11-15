@@ -1,4 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
+import { brief, redact } from '../hooks/transcript'
 
 const PANE = {
   plugin: 'agent-timeline',
@@ -371,5 +372,103 @@ test('a timeline an earlier version stored is declined', async ($, on) => {
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect((await ui.find({ type: 'Text' }))?.text).toBe('No activity yet.')
+  await ui.unmount()
+})
+
+test('credentials in a command are masked before the call is stored', () => {
+  expect(brief({ command: 'curl -H "Authorization: Bearer abc.def.ghi123" https://x' })).not.toContain('abc.def')
+  expect(brief({ command: 'export OPENAI_API_KEY=sk-proj-1234567890abcdef && run' })).not.toContain('1234567890')
+  expect(brief({ command: 'mysql --password=hunter22 db' })).not.toContain('hunter22')
+  expect(brief({ command: 'git clone https://me:ghp_abcdefghijklmnopqrstuvwxyz0123@github.com/o/r' })).not.toContain('ghp_')
+  expect(brief({ command: 'git push origin main' })).toBe('git push origin main')
+  expect(redact('token ghp_abcdefghijklmnopqrstuvwxyz0123 here')).toBe('token *** here')
+})
+
+test('a draw that fails says why instead of leaving the pane empty', async ($, on) => {
+  on('clock.now', () => {
+    throw new Error('boom')
+  })
+  on('state.get', (_, e, next) =>
+    e.key === 'timeline' ? { value: { value: { shape: 'timeline-1', value: { agents: [{ id: 'main', spans: [] }], hooks: [] } }, version: 1 } } : next(e),
+  )
+  for (const surface of ['terminal', 'desktop'] as const) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    expect((await ui.find({ type: 'Text', text: /^Draw failed/ }))?.text, surface).toMatch(/^Draw failed \(throw\): /)
+    await ui.unmount()
+  }
+})
+
+test('/clear starts the chart afresh', async ($, on) => {
+  mock.clock(on, { now: 1_700_000_000_000 })
+  on('command.register', () => ({ value: { command: 'agent-timeline-pane' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.end', (_, e) => ({ sessionId: e.sessionId }))
+  on('agent.spawn', () => ({ model: 'haiku', agentId: 'a1' }))
+  on('agent.list', () => ({ value: [] }))
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  await $.agent.spawn({
+    prompt: 'Look around the repo',
+    description: 'Survey repo',
+    subagentType: 'Explore',
+    provider: { plugin: 'engine', tier: 'core' },
+    parentModel: 'opus',
+    tool_use_id: 'spawn-1',
+    background: false,
+    fork: false,
+  })
+  await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ key: 'a1' })).toBeUndefined()
+  expect((await ui.find({ key: 'main' }))?.text).toBe('Main session')
+  await ui.unmount()
+})
+
+test('the open command says why the pane is not shown', async ($, on) => {
+  mock.clock(on, { now: 1_700_000_000_000 })
+  on('command.register', () => ({ value: { command: 'agent-timeline-pane' } }))
+  on('ui.open', () => ({ value: { isPlaced: false, reason: 'the terminal is 90 columns, under 110' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+
+  await $.session.start({ cwd: '/', surface: 'terminal', isInteractive: true })
+  const ran = await $.command.run({ command: 'agent-timeline-pane', args: '' } as never)
+  expect(ran.text).toBe('Agent timeline pane is not shown yet: the terminal is 90 columns, under 110')
+})
+
+test('an agent whose permission ask goes unanswered needs attention', async ($, on) => {
+  const clock = mock.clock(on, { now: 1_700_000_000_000 })
+  on('command.register', () => ({ value: { command: 'agent-timeline-pane' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('agent.list', () => ({ value: [{ id: 'a1', description: 'Deploy', type: 'general-purpose', status: 'running' }] }))
+  on('tool.call', () => ({ result: {} }))
+  on('tool.check', () => ({ decision: 'ask' }))
+  // Stands for the person: answers once the test lets it.
+  let answer = () => {}
+  const answered = new Promise<void>(resolve => (answer = resolve))
+  on('classic.PermissionRequest', async () => {
+    await answered
+    return { decision: { behavior: 'allow' } }
+  })
+
+  await $.session.start({ cwd: '/', surface: 'desktop', isInteractive: true })
+  const call = $.tool.call({ tool: 'Bash', command: 'npm publish', agentId: 'a1', tool_use_id: 't1' })
+  await clock.advance(1_000)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  // The classifier decides most asks within seconds: not yet a person's wait.
+  expect(await ui.find({ type: 'Text', text: /Needs attention/ })).toBeUndefined()
+  await clock.advance(15_000)
+  expect((await ui.find({ type: 'Text', text: /Needs attention/ }))?.text).toBe('⚠ Needs attention: Deploy (waiting for approval)')
+  await ui.press({ key: 'a1' })
+  expect((await ui.find({ type: 'Text', text: /Bash npm publish/ }))?.text).toMatch(/^\?/)
+
+  answer()
+  await call
+  await clock.advance(15_000)
+  expect(await ui.find({ type: 'Text', text: /Needs attention/ })).toBeUndefined()
+  expect((await ui.find({ type: 'Text', text: /Bash npm publish/ }))?.text).toMatch(/^✓/)
   await ui.unmount()
 })

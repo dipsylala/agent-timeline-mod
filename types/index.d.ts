@@ -6,6 +6,8 @@ export type Call = {
   at: number
   endAt?: number
   isError?: boolean
+  /** When its permission check answered "ask"; it waits on a decision until `endAt` is set. */
+  askedAt?: number
 }
 
 /** A settings hook that blocked something or handed the model a message. */
