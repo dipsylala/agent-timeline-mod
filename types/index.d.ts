@@ -51,6 +51,8 @@ export type SideSession = {
   isFork: boolean
   /** The transcript's size when last read, so an unchanged one is not read again. */
   size: number
+  /** Its subagents' transcripts as `name:size` when last read, comma-separated. */
+  agentSizes?: string
 }
 
 /** A brief this session handed a side session it started or proposed, matched to the transcript it opens. */

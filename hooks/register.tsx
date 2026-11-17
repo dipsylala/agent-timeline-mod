@@ -24,6 +24,8 @@ const COMMAND = 'agent-timeline-pane'
 const MAIN = 'main'
 // A side session's row id is this and its transcript's session id.
 const SIDE = 'session:'
+// A side session's subagent's row id is this, the session's id, `/` and the subagent's id.
+const SIDE_AGENT = 'session-agent:'
 
 // The same thresholds the agent-timeline skill uses.
 const RUNNING_WINDOW = 120_000 // unfinished and active this recently: Running
@@ -115,6 +117,11 @@ async function markClassic(
 
 function isSide(agent: Agent): boolean {
   return agent.id.startsWith(SIDE)
+}
+
+/** A subagent a side session ran: its row sits under that session's. */
+function isSideAgent(agent: Agent): boolean {
+  return agent.id.startsWith(SIDE_AGENT)
 }
 
 type Status ='Running' | 'Quiet' | 'Stalled' | 'Done' | 'Idle' | 'Failed' | 'Stopped'
@@ -607,7 +614,17 @@ async function poll($: EngineInterface) {
   const { sessions = [], briefs = [] } = await read($, timeline)
   for (const session of sessions) {
     const stat = await $.fs.stat(session.path).catch(() => undefined)
-    if (!stat || stat.size === session.size) continue
+    if (!stat) continue
+    // Its subagents keep their transcripts as this session's do: `<id>/subagents/` beside it.
+    const folder = `${session.path.replace(/\.jsonl$/, '')}/subagents`
+    const files = (await $.fs.list(folder).catch(() => [])).filter(f => f.kind === 'file' && /^agent-.+\.jsonl$/.test(f.name))
+    const agentSizes = files.map(f => `${f.name}:${f.size}`).join(',')
+    if (stat.size === session.size && agentSizes === (session.agentSizes ?? '')) continue
+    await pollAgents($, session, folder, files)
+    if (stat.size === session.size) {
+      await update($, timeline, tl => ({ ...tl, sessions: (tl.sessions ?? []).map(s => (s.id === session.id ? { ...s, agentSizes } : s)) }))
+      continue
+    }
     const text = await readTail($, session.path, stat.size)
     if (text === undefined) continue
     const brief = briefs.find(b => b.matched === session.id)
@@ -624,15 +641,44 @@ async function poll($: EngineInterface) {
       description: parsed.title ?? base.description,
       note: stat.size > TAIL ? `Read from the last ${megabytes(TAIL)} of a ${megabytes(stat.size)} transcript.` : undefined,
     }
-    await update($, timeline, tl => {
-      const index = tl.agents.findIndex(a => a.id === agent.id)
-      const old = tl.agents[index]
-      // The transcript is the row's whole truth, but a tail read keeps the earlier bars.
-      const row = old ? { ...agent, startedAt: Math.min(old.startedAt, agent.startedAt), spans: mergeSpans([...old.spans, ...agent.spans]) } : agent
-      const agents = index < 0 ? [...tl.agents, row] : tl.agents.map((a, i) => (i === index ? row : a))
-      const hooks = [...tl.hooks, ...newHooks(tl.hooks, parsed.hooks)].sort((a, b) => a.at - b.at).slice(-KEEP_HOOKS)
-      return { ...tl, agents, hooks, sessions: (tl.sessions ?? []).map(s => (s.id === session.id ? { ...s, size: stat.size } : s)) }
-    })
+    await update($, timeline, tl => ({
+      ...withRow(tl, agent, parsed.hooks),
+      sessions: (tl.sessions ?? []).map(s => (s.id === session.id ? { ...s, size: stat.size, agentSizes } : s)),
+    }))
+  }
+}
+
+/** A row read from its transcript put in the timeline: the transcript is its whole truth, but a tail read keeps the earlier bars. */
+function withRow(tl: Timeline, agent: Agent, marks: HookMark[]): Timeline {
+  const index = tl.agents.findIndex(a => a.id === agent.id)
+  const old = tl.agents[index]
+  const row = old ? { ...agent, startedAt: Math.min(old.startedAt, agent.startedAt), spans: mergeSpans([...old.spans, ...agent.spans]) } : agent
+  const agents = index < 0 ? [...tl.agents, row] : tl.agents.map((a, i) => (i === index ? row : a))
+  const hooks = [...tl.hooks, ...newHooks(tl.hooks, marks)].sort((a, b) => a.at - b.at).slice(-KEEP_HOOKS)
+  return { ...tl, agents, hooks }
+}
+
+/** Reads a side session's subagents whose transcripts changed into rows under its own. */
+async function pollAgents($: EngineInterface, session: SideSession, folder: string, files: { name: string; size: number }[]) {
+  const sizes = new Map((session.agentSizes ?? '').split(',').map(pair => [pair.slice(0, pair.lastIndexOf(':')), pair.slice(pair.lastIndexOf(':') + 1)]))
+  for (const file of files) {
+    if (sizes.get(file.name) === String(file.size)) continue
+    const id = /^agent-(.+)\.jsonl$/.exec(file.name)?.[1]
+    if (!id) continue
+    const text = await readSmall($, `${folder}/${file.name}`)
+    if (!text) continue
+    const meta = await $.fs
+      .read(`${folder}/agent-${id}.meta.json`)
+      .then(json => JSON.parse(json) as { description?: string; agentType?: string; finished?: boolean })
+      .catch(() => ({}) as { description?: string; agentType?: string; finished?: boolean })
+    const base = {
+      id: `${SIDE_AGENT}${session.id}/${id}`,
+      description: meta.description ?? `Agent ${id.slice(0, 8)}`,
+      type: meta.agentType ?? '',
+      parentId: `${SIDE}${session.id}`,
+    }
+    const parsed = parseTranscript(text, base, { finished: meta.finished })
+    if (parsed) await update($, timeline, tl => withRow(tl, parsed.agent, parsed.hooks))
   }
 }
 
@@ -665,6 +711,10 @@ export const register: Register = on => {
     // Statuses age (Running → Quiet → Stalled) with no event to redraw them.
     const started = await $.clock.now()
     await update($, now, () => started)
+    // A reload keeps the side sessions it linked: read each once more, as this code reads them.
+    await update($, timeline, tl =>
+      tl.sessions?.length ? { ...tl, sessions: tl.sessions.map(s => ({ ...s, size: -1, agentSizes: undefined })) } : tl,
+    )
     $.clock.every(15_000, () => {
       void $.clock.now().then(t => update($, now, () => t))
       scanSides($)
@@ -825,13 +875,16 @@ export const register: Register = on => {
     // Main first, then the latest subagents active in the window; unfinished
     // ones always stay.
     const main = all.filter(a => a.id === MAIN)
-    const inWindow = all.filter(a => a.id !== MAIN && !isSide(a) && (a.endedAt === undefined || a.lastAt >= t0))
+    const isRecent = (a: Agent) => a.endedAt === undefined || a.lastAt >= t0
+    const inWindow = all.filter(a => a.id !== MAIN && !isSide(a) && !isSideAgent(a) && isRecent(a))
     const unfinished = inWindow.filter(a => a.endedAt === undefined)
     const finished = inWindow.filter(a => a.endedAt !== undefined).slice(-Math.max(0, SHOWN_ROWS - 1 - unfinished.length))
     const subs = inWindow.filter(a => unfinished.includes(a) || finished.includes(a))
-    // Side sessions this one started, under the subagents.
-    const sides = all.filter(a => isSide(a) && (a.endedAt === undefined || a.lastAt >= t0)).sort((a, b) => a.startedAt - b.startedAt)
-    const shown = [...main, ...subs, ...sides]
+    // Side sessions this one started, under the subagents, each followed by the subagents it ran.
+    const byStart = (a: Agent, b: Agent) => a.startedAt - b.startedAt
+    const sides = all.filter(a => isSide(a) && isRecent(a)).sort(byStart)
+    const sideRows = sides.flatMap(side => [side, ...all.filter(a => isSideAgent(a) && a.parentId === side.id && isRecent(a)).sort(byStart)])
+    const shown = [...main, ...subs, ...sideRows]
     const hidden = all.length - shown.length
 
     const counts = new Map<Status, number>()
@@ -840,7 +893,11 @@ export const register: Register = on => {
     const labelColumns = Math.max(14, Math.min(30, Math.floor(e.props.bodyColumns * 0.32)))
     const timeColumns = 8
     const trackColumns = Math.max(10, e.props.bodyColumns - labelColumns - timeColumns - 2)
-    const shortLabel =(text: string) => (text.length > labelColumns - 3 ? `${text.slice(0, labelColumns - 4)}…` : text)
+    // A side session's subagent is indented under it: two columns fewer for its name.
+    const shortLabel = (text: string, indent = 0) => {
+      const room = labelColumns - 3 - indent
+      return text.length > room ? `${text.slice(0, room - 1)}…` : text
+    }
 
     // One agent's details at a time: another name switches to it, its own closes it.
     const choose = (id: string) => update($, selected, current => (current === id ? '' : id))
@@ -937,7 +994,7 @@ export const register: Register = on => {
             </Box>
           )}
 
-          {canOpenTranscript && agent.id !== MAIN && !isSide(agent) && (
+          {canOpenTranscript && agent.id !== MAIN && !isSide(agent) && !isSideAgent(agent) && (
             <Box flexDirection="row">
               <Button key={`view-${agent.id}`} label="Open transcript" onPress={() => void openTranscript(agent.id)} />
             </Box>
@@ -977,18 +1034,20 @@ export const register: Register = on => {
           {shown.map(agent => {
             const status = statusOf(agent, t)
             const marks = marksOf(agent)
+            const indent = isSideAgent(agent) ? 2 : 0
             const line = (
               <Box key={`agent-${agent.id}`} flexDirection="row" gap={1}>
                 <Box key={`label-${agent.id}`} width={labelColumns} flexDirection="row" gap={1}>
+                  {indent > 0 && <Text dimColor>└</Text>}
                   <Text color={STATUS_THEME[status]}>●</Text>
                   <Button key={agent.id} plain onPress={() => choose(agent.id)}>
-                    <Text bold={agent.id === chosen}>{shortLabel(agent.description)}</Text>
+                    <Text bold={agent.id === chosen}>{shortLabel(agent.description, indent)}</Text>
                   </Button>
                   {/* A cut name shows whole on hover, over the name itself; the card has its
                       own Button, as it covers the name's. inverseText is the theme's background
                       colour, so the card hides what is under it. */}
-                  {shortLabel(agent.description) !== agent.description && (
-                    <Box position="absolute" top={0} left={2} display="none" hover={{ display: 'flex' }} backgroundColor="inverseText">
+                  {shortLabel(agent.description, indent) !== agent.description && (
+                    <Box position="absolute" top={0} left={2 + indent} display="none" hover={{ display: 'flex' }} backgroundColor="inverseText">
                       <Button key={`${agent.id}-full`} plain onPress={() => choose(agent.id)}>
                         <Text bold={agent.id === chosen}>{agent.description}</Text>
                       </Button>

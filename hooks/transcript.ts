@@ -198,8 +198,14 @@ export function parseTranscript(
   }
 }
 
-/** Whether a turn is running after this entry: a prompt or a tool call opens one, a final answer or an interrupt ends it. */
+/**
+ * Whether a turn is running after this entry: a request to the model or a
+ * tool call opens one, a final answer or an interrupt ends it. A prompt alone
+ * does not: one can be written and wait unanswered (a background task's
+ * notice to a session that has gone quiet).
+ */
 function turnAfter(entry: Entry, content: unknown, at: number, before: { at: number; ending: 'answer' | 'aborted' | 'refusal' } | undefined) {
+  if (entry.type === 'api-request') return undefined
   if (entry.type === 'assistant') {
     const stop = entry.message?.stop_reason
     if (stop && TURN_ENDS.has(stop)) return { at, ending: stop === 'refusal' ? ('refusal' as const) : ('answer' as const) }
@@ -209,9 +215,8 @@ function turnAfter(entry: Entry, content: unknown, at: number, before: { at: num
   const blocks = Array.isArray(content) ? (content as Block[]) : []
   // A tool's result hands back to the model, which goes on in the same turn.
   if (blocks.some(b => b.type === 'tool_result')) return undefined
-  const said = textOf(content).trim()
-  if (said.startsWith('[Request interrupted')) return { at, ending: 'aborted' as const }
-  return said ? undefined : before
+  if (textOf(content).trim().startsWith('[Request interrupted')) return { at, ending: 'aborted' as const }
+  return before
 }
 
 /** A brief this session handed to a side session it started or proposed, from its transcript. */
