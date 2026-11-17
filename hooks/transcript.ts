@@ -267,7 +267,7 @@ export function briefsOf(text: string): SpawnBrief[] {
 }
 
 /** What the start of a transcript says about its link to this session. */
-export type Lineage = { kind: 'fork' } | { kind: 'started'; firstPrompt: string; title?: string } | { kind: 'other' } | { kind: 'undecided' }
+export type Lineage = { kind: 'fork'; title?: string } | { kind: 'started'; firstPrompt: string; title?: string } | { kind: 'other' } | { kind: 'undecided' }
 
 /**
  * Reads the head of another session's transcript. A fork opens with a copy
@@ -277,10 +277,12 @@ export type Lineage = { kind: 'fork' } | { kind: 'started'; firstPrompt: string;
  *
  * When this session is itself a fork, its copy carries its own parent's
  * entries first, so a fork of it shows this session's id only after those.
+ * A fork's title is the latest it recorded as its own within the head.
  */
 export function lineageOf(head: string, fileId: string, ownId: string): Lineage {
   let title: string | undefined
   let isCopy = false
+  let isFork = false
   for (const line of head.split('\n')) {
     if (!line.trim()) continue
     let entry: Entry
@@ -290,16 +292,18 @@ export function lineageOf(head: string, fileId: string, ownId: string): Lineage 
       continue
     }
     if (!entry.sessionId) continue
-    if (entry.sessionId === ownId && fileId !== ownId) return { kind: 'fork' }
+    if (entry.sessionId === ownId && fileId !== ownId) isFork = true
     if (entry.sessionId !== fileId) {
       isCopy = true // another session's copied entries
       continue
     }
+    if (entry.type === 'custom-title' && entry.customTitle) title = entry.customTitle
+    if (isFork) continue // read on for the title it gives itself
     // Its own entries begin: a copy of others' with none of ours is someone else's fork.
     if (isCopy) return { kind: 'other' }
-    if (entry.type === 'custom-title' && entry.customTitle) title = entry.customTitle
     if (entry.type === 'user') return { kind: 'started', firstPrompt: textOf(entry.message?.content), title }
   }
+  if (isFork) return { kind: 'fork', title }
   return { kind: isCopy ? 'other' : 'undecided' }
 }
 

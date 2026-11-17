@@ -575,16 +575,19 @@ async function discover($: EngineInterface, pending: Brief[]) {
       if (lineage.kind === 'undecided') continue // its first prompt is not written yet
       let brief: Brief | undefined
       if (lineage.kind === 'fork') {
-        brief = unmatched.find(b => b.isFork && b.localId === undefined)
+        // A fork named for no id is matched by the title it was given, which it records as its own.
+        brief = unmatched.find(b => b.isFork && b.localId === undefined && (b.title === undefined || b.title === lineage.title))
       } else if (lineage.kind === 'started') {
         const said = squash(lineage.firstPrompt)
         brief = unmatched.find(b => !b.isFork && b.prompt !== undefined && said.includes(squash(b.prompt).slice(0, 2000)))
       }
-      if (lineage.kind === 'other' || (lineage.kind === 'started' && !brief)) {
+      // A transcript no brief matches is not a session this one started: a desktop
+      // side chat is a fork of this session too.
+      if (lineage.kind === 'other' || !brief) {
         rejected.add(path)
         continue
       }
-      if (brief) unmatched.splice(unmatched.indexOf(brief), 1)
+      unmatched.splice(unmatched.indexOf(brief), 1)
       found.push({ session: { id, path, isFork: lineage.kind === 'fork', size: -1 }, brief })
     }
   }
@@ -947,9 +950,11 @@ export const register: Register = on => {
     const view = (
       <Box flexDirection="column" gap={1}>
         <Box flexDirection="row" gap={2}>
-          <Text bold>
-            {subs.length} agent{subs.length === 1 ? '' : 's'}
-          </Text>
+          {(subs.length > 0 || sides.length === 0) && (
+            <Text bold>
+              {subs.length} agent{subs.length === 1 ? '' : 's'}
+            </Text>
+          )}
           {sides.length > 0 && (
             <Text bold>
               {sides.length} side session{sides.length === 1 ? '' : 's'}
