@@ -62,12 +62,14 @@ type Block = {
 type Entry = {
   timestamp?: string
   type?: string
+  sessionId?: string
+  customTitle?: string
   subtype?: string
   uuid?: string
   toolUseID?: string
   preventedContinuation?: boolean
   stopReason?: string
-  message?: { content?: unknown }
+  message?: { content?: unknown; stop_reason?: string }
   attachment?: {
     type?: string
     hookEvent?: string
@@ -109,22 +111,33 @@ function hookOf(entry: Entry, at: number, agentId?: string): HookMark | undefine
   return undefined
 }
 
+// The stop reasons that end a turn; `tool_use` goes on to run the tools.
+const TURN_ENDS = new Set(['end_turn', 'stop_sequence', 'max_tokens', 'refusal'])
+
 /**
  * One agent's row and hook marks from its transcript's text. `finished`
  * comes from the subagent's meta file; the main session's is left to the
  * live events.
+ *
+ * For a side session, `sessionId` keeps only its own entries (a fork's
+ * transcript opens with a copy of its parent's), `isSession` reads whether
+ * its latest turn has ended from the transcript itself, and `title` is the
+ * latest name it was given.
  */
 export function parseTranscript(
   text: string,
   base: Pick<Agent, 'id' | 'description' | 'type' | 'parentId'>,
-  options: { finished?: boolean; isMain?: boolean } = {},
-): { agent: Agent; hooks: HookMark[] } | undefined {
+  options: { finished?: boolean; isMain?: boolean; sessionId?: string; isSession?: boolean } = {},
+): { agent: Agent; hooks: HookMark[]; title?: string } | undefined {
   const times: number[] = []
   const calls = new Map<string, Call>()
   const hooks: HookMark[] = []
   const agentId = options.isMain ? undefined : base.id
   let result: string | undefined
   let lastCleanAt = 0
+  let title: string | undefined
+  // When the latest turn ended and how, or undefined while one runs.
+  let turnEnd: { at: number; ending: 'answer' | 'aborted' | 'refusal' } | undefined
 
   for (const line of text.split('\n')) {
     if (!line.trim()) continue
@@ -134,12 +147,15 @@ export function parseTranscript(
     } catch {
       continue // a line still being written
     }
+    if (options.sessionId && entry.sessionId && entry.sessionId !== options.sessionId) continue
+    if (entry.type === 'custom-title' && entry.customTitle) title = entry.customTitle
     const at = entry.timestamp ? Date.parse(entry.timestamp) : NaN
     if (Number.isNaN(at)) continue
     times.push(at)
     const hook = hookOf(entry, at, agentId)
     if (hook) hooks.push(hook)
     const content = entry.message?.content
+    if (options.isSession) turnEnd = turnAfter(entry, content, at, turnEnd)
     if (!Array.isArray(content)) continue
     for (const block of content as Block[]) {
       if (entry.type === 'assistant' && block.type === 'tool_use' && block.id && !calls.has(block.id)) {
@@ -170,6 +186,7 @@ export function parseTranscript(
       startedAt: first[0],
       lastAt: last[1],
       ...(options.finished ? { endedAt: last[1], ending: 'answer' as const } : {}),
+      ...(options.isSession && turnEnd ? { endedAt: turnEnd.at, ending: turnEnd.ending } : {}),
       lastCleanAt,
       spans,
       calls: all.slice(-KEEP_CALLS),
@@ -177,7 +194,113 @@ export function parseTranscript(
       result: result?.slice(0, 4000),
     },
     hooks,
+    title,
   }
+}
+
+/** Whether a turn is running after this entry: a prompt or a tool call opens one, a final answer or an interrupt ends it. */
+function turnAfter(entry: Entry, content: unknown, at: number, before: { at: number; ending: 'answer' | 'aborted' | 'refusal' } | undefined) {
+  if (entry.type === 'assistant') {
+    const stop = entry.message?.stop_reason
+    if (stop && TURN_ENDS.has(stop)) return { at, ending: stop === 'refusal' ? ('refusal' as const) : ('answer' as const) }
+    return stop ? undefined : before
+  }
+  if (entry.type !== 'user') return before
+  const blocks = Array.isArray(content) ? (content as Block[]) : []
+  // A tool's result hands back to the model, which goes on in the same turn.
+  if (blocks.some(b => b.type === 'tool_result')) return undefined
+  const said = textOf(content).trim()
+  if (said.startsWith('[Request interrupted')) return { at, ending: 'aborted' as const }
+  return said ? undefined : before
+}
+
+/** A brief this session handed to a side session it started or proposed, from its transcript. */
+export type SpawnBrief = { at: number; title?: string; prompt?: string; isFork: boolean; localId?: string }
+
+export const START_SESSION = 'mcp__ccd_session__start_session'
+export const HAND_OFF = 'mcp__ccd_session__hand_off_to_session'
+const LOCAL_ID = /local_([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})/
+
+/**
+ * The brief a start_session or hand_off_to_session call carried, and the id
+ * the app gave the session in its result. Undefined for a call that starts
+ * nothing to match (an offer's title alone, a proposal started by its id).
+ */
+export function briefOf(tool: string, input: Record<string, unknown>, at: number, resultText = ''): SpawnBrief | undefined {
+  const str = (v: unknown) => (typeof v === 'string' && v.trim() ? v.trim() : undefined)
+  const localId = LOCAL_ID.exec(resultText)?.[1]
+  if (tool === HAND_OFF) return { at, title: str(input.title), prompt: str(input.remaining_plan), isFork: true, localId }
+  if (tool !== START_SESSION) return undefined
+  const prompt = str(input.prompt)
+  const isFork = input.context === 'fork'
+  if (!prompt && !isFork) return undefined
+  return { at, title: str(input.title), prompt, isFork, localId }
+}
+
+/** The side-session briefs in a transcript's text, each with the id its result named. */
+export function briefsOf(text: string): SpawnBrief[] {
+  const calls = new Map<string, { at: number; tool: string; input: Record<string, unknown> }>()
+  const out: SpawnBrief[] = []
+  for (const line of text.split('\n')) {
+    if (!line.includes(START_SESSION) && !line.includes(HAND_OFF) && !calls.size) continue
+    let entry: Entry
+    try {
+      entry = JSON.parse(line) as Entry
+    } catch {
+      continue
+    }
+    const at = entry.timestamp ? Date.parse(entry.timestamp) : NaN
+    const content = entry.message?.content
+    if (Number.isNaN(at) || !Array.isArray(content)) continue
+    for (const block of content as Block[]) {
+      if (entry.type === 'assistant' && block.type === 'tool_use' && block.id && (block.name === START_SESSION || block.name === HAND_OFF)) {
+        calls.set(block.id, { at, tool: block.name, input: block.input ?? {} })
+      } else if (entry.type === 'user' && block.type === 'tool_result' && block.tool_use_id && calls.has(block.tool_use_id)) {
+        const call = calls.get(block.tool_use_id)!
+        calls.delete(block.tool_use_id)
+        const brief = block.is_error ? undefined : briefOf(call.tool, call.input, call.at, textOf(block.content))
+        if (brief) out.push(brief)
+      }
+    }
+  }
+  return out
+}
+
+/** What the start of a transcript says about its link to this session. */
+export type Lineage = { kind: 'fork' } | { kind: 'started'; firstPrompt: string; title?: string } | { kind: 'other' } | { kind: 'undecided' }
+
+/**
+ * Reads the head of another session's transcript. A fork opens with a copy
+ * of its parent's entries, which keep the parent's session id. A session
+ * started fresh opens with its own id, and its first prompt holds the brief
+ * it was handed. Undecided until that prompt is written.
+ *
+ * When this session is itself a fork, its copy carries its own parent's
+ * entries first, so a fork of it shows this session's id only after those.
+ */
+export function lineageOf(head: string, fileId: string, ownId: string): Lineage {
+  let title: string | undefined
+  let isCopy = false
+  for (const line of head.split('\n')) {
+    if (!line.trim()) continue
+    let entry: Entry
+    try {
+      entry = JSON.parse(line) as Entry
+    } catch {
+      continue
+    }
+    if (!entry.sessionId) continue
+    if (entry.sessionId === ownId && fileId !== ownId) return { kind: 'fork' }
+    if (entry.sessionId !== fileId) {
+      isCopy = true // another session's copied entries
+      continue
+    }
+    // Its own entries begin: a copy of others' with none of ours is someone else's fork.
+    if (isCopy) return { kind: 'other' }
+    if (entry.type === 'custom-title' && entry.customTitle) title = entry.customTitle
+    if (entry.type === 'user') return { kind: 'started', firstPrompt: textOf(entry.message?.content), title }
+  }
+  return { kind: isCopy ? 'other' : 'undecided' }
 }
 
 /** A row the mod saw live joined with the same agent rebuilt from its transcript. */

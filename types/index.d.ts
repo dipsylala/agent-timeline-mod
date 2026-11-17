@@ -43,8 +43,32 @@ export type Agent = {
   note?: string
 }
 
+/** A desktop side session this one started, linked to its transcript. Its row's id is `session:<id>`. */
+export type SideSession = {
+  /** The transcript's own session id, its file's name. */
+  id: string
+  path: string
+  isFork: boolean
+  /** The transcript's size when last read, so an unchanged one is not read again. */
+  size: number
+}
+
+/** A brief this session handed a side session it started or proposed, matched to the transcript it opens. */
+export type Brief = {
+  at: number
+  title?: string
+  prompt?: string
+  isFork: boolean
+  /** The id the desktop app gave the session (a fork's transcript is named for it). */
+  localId?: string
+  /** The transcript it was matched to. */
+  matched?: string
+}
+
 export type Timeline = {
   agents: Agent[]
+  sessions?: SideSession[]
+  briefs?: Brief[]
   hooks: HookMark[]
   /** Where the chart starts when the main transcript was read from its tail only. */
   since?: number

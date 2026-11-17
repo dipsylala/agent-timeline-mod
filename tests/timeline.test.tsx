@@ -1,5 +1,5 @@
 import { expect, mock, test } from 'claude-code/testing'
-import { brief, redact } from '../hooks/transcript'
+import { brief, lineageOf, redact } from '../hooks/transcript'
 
 const PANE = {
   plugin: 'agent-timeline',
@@ -471,4 +471,144 @@ test('an agent whose permission ask goes unanswered needs attention', async ($, 
   expect(await ui.find({ type: 'Text', text: /Needs attention/ })).toBeUndefined()
   expect((await ui.find({ type: 'Text', text: /Bash npm publish/ }))?.text).toMatch(/^✓/)
   await ui.unmount()
+})
+
+test('side sessions this one started get rows from their transcripts', async ($, on) => {
+  const T0 = 1_700_000_000_000
+  const clock = mock.clock(on, { now: T0 })
+  const at = (s: number) => new Date(T0 + s * 1000).toISOString()
+  const PROJECTS = '/home/u/.claude/projects'
+  const OWN = 's1'
+  const FRESH = '3f91afa4-54c3-424e-84bf-524dc217e625'
+  const FORK = 'a9717fd2-17bf-4767-b7af-5b5c92c0b709'
+  const lines = (entries: object[]) => entries.map(entry => JSON.stringify(entry)).join('\n')
+  const BRIEF = 'Rename the `widget` helper in `src/util.ts`. Done when the tests pass.'
+  // As the desktop app writes them: a fresh session in its worktree's folder,
+  // its first prompt wrapping the brief; a fork beside this session, opening
+  // with a copy of this session's entries.
+  const fresh = [
+    { type: 'queue-operation', operation: 'enqueue', timestamp: at(2), sessionId: FRESH },
+    {
+      type: 'user',
+      timestamp: at(2),
+      sessionId: FRESH,
+      turnOrigin: 'host_synthetic',
+      message: { content: `<system-reminder>worktree</system-reminder>\n\nBackground (from the session that started this one):\nContext.\n\nTask:\n${BRIEF}` },
+    },
+    { type: 'custom-title', customTitle: 'Rename widget', sessionId: FRESH },
+    {
+      type: 'assistant',
+      timestamp: at(4),
+      sessionId: FRESH,
+      message: { stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'toolu_f1', name: 'Bash', input: { command: 'npm test' } }] },
+    },
+  ]
+  const files: Record<string, string> = {
+    [`${PROJECTS}/-work/${OWN}.jsonl`]: lines([{ type: 'user', timestamp: at(0), sessionId: OWN, message: { content: 'Hi' } }]),
+    [`${PROJECTS}/-work--claude-worktrees-x/${FRESH}.jsonl`]: lines(fresh),
+    [`${PROJECTS}/-work/${FORK}.jsonl`]: lines([
+      { type: 'user', timestamp: at(-100), sessionId: OWN, message: { content: 'Hi' } },
+      {
+        type: 'assistant',
+        timestamp: at(-90),
+        sessionId: OWN,
+        message: { stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'toolu_parent', name: 'Read', input: { file_path: '/parent.ts' } }] },
+      },
+      { type: 'custom-title', customTitle: 'Parent title', sessionId: FORK },
+      { type: 'user', timestamp: at(3), sessionId: FORK, turnOrigin: 'host_synthetic', message: { content: 'You are a fork. Check the docs.' } },
+      { type: 'custom-title', customTitle: 'Check docs', sessionId: FORK },
+      { type: 'assistant', timestamp: at(6), sessionId: FORK, message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'Docs are fine.' }] } },
+    ]),
+    // Someone else's session, changed meanwhile: no row.
+    [`${PROJECTS}/-other/0000aaaa-0000-0000-0000-000000000000.jsonl`]: lines([
+      { type: 'user', timestamp: at(2), sessionId: '0000aaaa-0000-0000-0000-000000000000', message: { content: 'Unrelated work' } },
+    ]),
+  }
+  const norm = (path: string) => path.replace(/\\/g, '/').replace(/^[A-Za-z]:/, '')
+  const stat = (path: string) => ({ kind: 'file' as const, size: files[path]?.length ?? 0, mtimeMs: T0 + 6_000, isLink: false })
+  on('command.register', () => ({ value: { command: 'agent-timeline-pane' } }))
+  on('ui.open', () => ({ value: { isPlaced: true } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+  on('session.id', () => ({ value: OWN }))
+  on('env.get', (_, e) => ({ value: e.name === 'HOME' ? '/home/u' : undefined }))
+  on('fs.exists', (_, e) => ({ value: files[norm(e.path)] !== undefined }))
+  on('fs.stat', (_, e) => {
+    if (files[norm(e.path)] === undefined) throw new Error(`ENOENT ${e.path}`)
+    return { value: stat(norm(e.path)) }
+  })
+  on('fs.list', (_, e) => {
+    const dir = norm(e.path)
+    const below = Object.keys(files).filter(path => path.startsWith(`${dir}/`))
+    const names = [...new Set(below.map(path => path.slice(dir.length + 1).split('/')[0] ?? ''))]
+    return {
+      value: names.map(name =>
+        below.includes(`${dir}/${name}`) ? { name, ...stat(`${dir}/${name}`) } : { name, kind: 'dir' as const, size: 0, mtimeMs: 0, isLink: false },
+      ),
+    }
+  })
+  on('fs.read', (_, e) => {
+    const text = files[norm(e.path)]
+    if (text === undefined) throw new Error(`ENOENT ${e.path}`)
+    return { value: text }
+  })
+  // Stands for the desktop app's session tools.
+  on('tool.call', (_, e) => ({
+    result: {},
+    text: e.tool.endsWith('start_session')
+      ? `Started session (session_id: local_${(e as { context?: string }).context === 'fork' ? FORK : '658516cb-2c8c-4126-bb0b-b7154ab55d88'}).`
+      : '',
+  }))
+
+  await $.session.start({ cwd: '/work', surface: 'desktop', isInteractive: true })
+  await clock.advance(10)
+  const start = (input: object, id: string) =>
+    $.tool.call({ tool: 'mcp__ccd_session__start_session', initiation: 'user_asked', tool_use_id: id, ...input } as never)
+  await start({ title: 'Rename widget', context: 'fresh', prompt: BRIEF, background: 'Context.' }, 'toolu_s1')
+  await start({ title: 'Check docs', context: 'fork', prompt: 'Check the docs.' }, 'toolu_s2')
+  await clock.advance(3_000)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  expect(await ui.find({ type: 'Text', text: /^2 side sessions/ }), 'summary').toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'SIDE SESSIONS' }), 'heading').toBeDefined()
+  expect((await ui.find({ key: `session:${FRESH}` }))?.text).toBe('Rename widget')
+  expect((await ui.find({ key: `session:${FORK}` }))?.text).toBe('Check docs')
+  expect(await ui.find({ key: 'session:0000aaaa-0000-0000-0000-000000000000' }), 'unrelated').toBeUndefined()
+
+  // The fresh session is mid tool call; the fork has answered and waits.
+  await ui.press({ key: `session:${FRESH}` })
+  expect(await ui.find({ type: 'Text', text: /^Rename widget · Running · side session · .* · 1 call$/ }), 'fresh header').toBeDefined()
+  await ui.press({ key: `session:${FORK}` })
+  expect(await ui.find({ type: 'Text', text: /^Check docs · Idle · side session \(fork\) · .* · 0 calls$/ }), 'fork header').toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /Read \/parent.ts/ }), "the parent's copied call").toBeUndefined()
+  expect(await ui.find({ type: 'Markdown', text: /Docs are fine\./ }), 'latest reply').toBeDefined()
+
+  // The fresh session's transcript grows: its turn ends.
+  files[`${PROJECTS}/-work--claude-worktrees-x/${FRESH}.jsonl`] = lines([
+    ...fresh,
+    { type: 'user', timestamp: at(20), sessionId: FRESH, message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_f1', content: 'ok' }] } },
+    { type: 'assistant', timestamp: at(22), sessionId: FRESH, message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'Renamed.' }] } },
+  ])
+  await clock.advance(15_000)
+  await ui.press({ key: `session:${FRESH}` })
+  expect(await ui.find({ type: 'Text', text: /^Rename widget · Idle · side session · .* · 1 call$/ }), 'fresh idle').toBeDefined()
+  expect((await ui.find({ type: 'Text', text: /Bash npm test/ }))?.text).toMatch(/^✓/)
+  await ui.unmount()
+})
+
+test("a transcript's start says whether it is a side session of this one", () => {
+  const head = (...entries: object[]) => entries.map(entry => JSON.stringify(entry)).join('\n')
+  const prompt = (sessionId: string, content: string) => ({ type: 'user', sessionId, message: { content } })
+  // A fork of this session, and a fork of it when it is itself a fork of g.
+  expect(lineageOf(head(prompt('me', 'Hi'), prompt('kid', 'Go')), 'kid', 'me').kind).toBe('fork')
+  expect(lineageOf(head(prompt('g', 'Old'), prompt('me', 'Hi'), prompt('kid', 'Go')), 'kid', 'me').kind).toBe('fork')
+  // Someone else's fork, and someone else's session.
+  expect(lineageOf(head(prompt('g', 'Old'), prompt('kid', 'Go')), 'kid', 'me').kind).toBe('other')
+  expect(lineageOf(head(prompt('g', 'Old')), 'kid', 'me').kind).toBe('other')
+  // A fresh session: its first prompt, once written.
+  expect(lineageOf(head({ type: 'queue-operation', sessionId: 'kid' }), 'kid', 'me').kind).toBe('undecided')
+  expect(lineageOf(head({ type: 'queue-operation', sessionId: 'kid' }, prompt('kid', 'Task: do it')), 'kid', 'me')).toEqual({
+    kind: 'started',
+    firstPrompt: 'Task: do it',
+    title: undefined,
+  })
 })
