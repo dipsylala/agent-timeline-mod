@@ -1,14 +1,29 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register, ThemeKey } from 'claude-code'
 
-import type { Agent, Call, HookMark, Timeline } from '../types'
-import { brief, IDLE_GAP, KEEP_CALLS, mergeAgent, mergeSpans, newHooks, parseTranscript } from './transcript'
+import type { Agent, Brief, Call, HookMark, SideSession, Timeline } from '../types'
+import {
+  brief,
+  briefOf,
+  briefsOf,
+  HAND_OFF,
+  IDLE_GAP,
+  KEEP_CALLS,
+  lineageOf,
+  mergeAgent,
+  mergeSpans,
+  newHooks,
+  parseTranscript,
+  START_SESSION,
+} from './transcript'
 
 const PANE = 'agent-timeline'
 const TITLE = 'Agent timeline'
 // Not "agent-timeline": the agent-timeline skill holds that command.
 const COMMAND = 'agent-timeline-pane'
 const MAIN = 'main'
+// A side session's row id is this and its transcript's session id.
+const SIDE = 'session:'
 
 // The same thresholds the agent-timeline skill uses.
 const RUNNING_WINDOW = 120_000 // unfinished and active this recently: Running
@@ -20,6 +35,13 @@ const KEEP_HOOKS = 200
 const SHOWN_ROWS = 30
 const SHOWN_CALLS = 8
 const MAX_READ = 4 * 1024 * 1024 // $.fs.read rejects a file larger than this
+
+// A side session's transcript is looked for while a brief is unmatched: on
+// every tick for FAST_SCAN after the brief, then on every fourth, and not
+// after BRIEF_TTL (a proposal card the person never starts).
+const FAST_SCAN = 120_000
+const BRIEF_TTL = 7 * 24 * 3_600_000
+const HEAD = 262_144 // how much of a transcript's start says whose it is
 
 const EMPTY: Timeline = { agents: [], hooks: [] }
 // Change the tag when Agent, Call or HookMark change shape: a reload keeps
@@ -91,13 +113,18 @@ async function markClassic(
   })
 }
 
+function isSide(agent: Agent): boolean {
+  return agent.id.startsWith(SIDE)
+}
+
 type Status ='Running' | 'Quiet' | 'Stalled' | 'Done' | 'Idle' | 'Failed' | 'Stopped'
 
 function statusOf(agent: Agent, t: number): Status {
   if (agent.endedAt !== undefined) {
     if (agent.ending === 'error' || agent.ending === 'refusal') return 'Failed'
     if (agent.ending === 'aborted') return 'Stopped'
-    return agent.id === MAIN ? 'Idle' : 'Done'
+    // A session that ends its turn waits for its person; a subagent is through.
+    return agent.id === MAIN || isSide(agent) ? 'Idle' : 'Done'
   }
   const age = t - agent.lastAt
   return age <= RUNNING_WINDOW ? 'Running' : age <= STALL_AFTER ? 'Quiet' : 'Stalled'
@@ -345,11 +372,16 @@ function layered(id: string, source: string, at: number): { sources: string[]; i
     : { sources: [known.current, known.previous], isSettling: true }
 }
 
+/** Where Claude Code keeps every session's transcript, one folder per starting directory. */
+async function projectsDir($: EngineInterface): Promise<string> {
+  const home = (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME')) ?? ''
+  return `${(await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${home}/.claude`}/projects`
+}
+
 /** This session's transcript folder: `<id>.jsonl` beside it, `subagents/` inside it. */
 async function sessionDir($: EngineInterface, cwd: string): Promise<string | undefined> {
   const id = await $.session.id()
-  const home = (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME')) ?? ''
-  const projects = `${(await $.env.get('CLAUDE_CONFIG_DIR')) ?? `${home}/.claude`}/projects`
+  const projects = await projectsDir($)
   const guess = `${projects}/${cwd.replace(/[^A-Za-z0-9]/g, '-')}`
   if (await $.fs.exists(`${guess}/${id}.jsonl`)) return `${guess}/${id}`
   // The folder is named for where the session started, which may not be cwd now.
@@ -399,6 +431,22 @@ async function readTail($: EngineInterface, path: string, size: number): Promise
   return text !== undefined && size > TAIL ? text.slice(text.indexOf('\n') + 1) : text
 }
 
+const HEAD_PS = [
+  '[Console]::OutputEncoding = [Text.UTF8Encoding]::new($false)',
+  `$f = [IO.File]::OpenRead($env:AGENT_TIMELINE_FILE); $n = [Math]::Min($f.Length, ${HEAD})`,
+  '$b = New-Object byte[] $n; $got = 0; while ($got -lt $n) { $got += $f.Read($b, $got, $n - $got) }; $f.Close()',
+  '[Console]::Out.Write([Text.Encoding]::UTF8.GetString($b)); [Console]::Out.Flush()',
+].join('; ')
+
+/** A transcript's first HEAD bytes or more: the whole file when one read takes it, else from a command. */
+async function readHead($: EngineInterface, path: string, size: number): Promise<string | undefined> {
+  if (size <= MAX_READ) return $.fs.read(path).catch(() => undefined)
+  const isWindows = (await $.env.get('OS')) === 'Windows_NT'
+  const argv = isWindows ? ['powershell', '-NoProfile', '-NonInteractive', '-Command', HEAD_PS] : ['head', '-c', String(HEAD), path]
+  const run = await $.process.run(argv, { env: { AGENT_TIMELINE_FILE: path }, timeoutMs: 60_000 }).catch(() => undefined)
+  return run?.exitCode === 0 ? run.stdout : undefined
+}
+
 function megabytes(bytes: number): string {
   return `${(bytes / 1e6).toFixed(bytes < 10e6 ? 1 : 0)} MB`
 }
@@ -418,6 +466,8 @@ async function backfill($: EngineInterface, cwd: string) {
   const tail = mainSize > 0 ? await readTail($, mainPath, mainSize) : undefined
   const main = tail ? parseTranscript(tail, { id: MAIN, description: 'Main session', type: 'main' }, { isMain: true }) : undefined
   if (main) found.push({ ...main, isMain: true })
+  // Side sessions started before the mod loaded are matched by the briefs they were handed.
+  if (tail) await addBriefs($, briefsOf(tail))
   const window = main && mainSize > TAIL ? { since: main.agent.startedAt, transcriptBytes: mainSize } : {}
   const folder = `${dir}/subagents`
   for (const entry of await $.fs.list(folder).catch(() => [])) {
@@ -473,6 +523,135 @@ async function backfill($: EngineInterface, cwd: string) {
   })
 }
 
+// Transcripts read and found to be no side session of this one; cleared when a brief comes.
+const rejected = new Set<string>()
+let scans = 0
+let isScanning = false
+
+const briefKey = (b: Brief) => `${b.isFork}|${b.title ?? ''}|${b.prompt ?? ''}`
+const squash = (text: string) => text.replace(/\s+/g, ' ').trim()
+
+/** Remembers briefs this session handed side sessions; the same brief seen live and in the transcript is kept once. */
+async function addBriefs($: EngineInterface, briefs: Brief[]) {
+  if (briefs.length === 0) return
+  rejected.clear()
+  await update($, timeline, tl => {
+    const known = tl.briefs ?? []
+    const isKnown = (b: Brief) =>
+      known.some(k => (b.localId !== undefined && k.localId === b.localId) || (briefKey(k) === briefKey(b) && Math.abs(k.at - b.at) < 600_000))
+    const added = briefs.filter(b => !isKnown(b))
+    return added.length === 0 ? tl : { ...tl, briefs: [...known, ...added] }
+  })
+}
+
+/**
+ * Looks through every project's transcripts changed since the oldest
+ * unmatched brief for the side sessions they started: a fork by its copy of
+ * this session's entries, a fresh session by the brief in its first prompt.
+ */
+async function discover($: EngineInterface, pending: Brief[]) {
+  const ownId = await $.session.id()
+  const projects = await projectsDir($)
+  const since = Math.min(...pending.map(b => b.at)) - 5_000
+  const known = new Set(((await read($, timeline)).sessions ?? []).map(s => s.id))
+  const unmatched = [...pending]
+  const found: { session: SideSession; brief?: Brief }[] = []
+  for (const dir of await $.fs.list(projects).catch(() => [])) {
+    if (dir.kind !== 'dir') continue
+    for (const file of await $.fs.list(`${projects}/${dir.name}`).catch(() => [])) {
+      const id = /^(.+)\.jsonl$/.exec(file.name)?.[1]
+      const path = `${projects}/${dir.name}/${file.name}`
+      if (!id || file.kind !== 'file' || id === ownId || known.has(id) || rejected.has(path) || file.mtimeMs < since) continue
+      // A fork's transcript is named for the id the app gave it: no need to read it.
+      const named = unmatched.find(b => b.isFork && b.localId === id)
+      if (named) {
+        unmatched.splice(unmatched.indexOf(named), 1)
+        found.push({ session: { id, path, isFork: true, size: -1 }, brief: named })
+        continue
+      }
+      const head = await readHead($, path, file.size)
+      if (head === undefined) continue
+      const lineage = lineageOf(head, id, ownId)
+      if (lineage.kind === 'undecided') continue // its first prompt is not written yet
+      let brief: Brief | undefined
+      if (lineage.kind === 'fork') {
+        brief = unmatched.find(b => b.isFork && b.localId === undefined)
+      } else if (lineage.kind === 'started') {
+        const said = squash(lineage.firstPrompt)
+        brief = unmatched.find(b => !b.isFork && b.prompt !== undefined && said.includes(squash(b.prompt).slice(0, 2000)))
+      }
+      if (lineage.kind === 'other' || (lineage.kind === 'started' && !brief)) {
+        rejected.add(path)
+        continue
+      }
+      if (brief) unmatched.splice(unmatched.indexOf(brief), 1)
+      found.push({ session: { id, path, isFork: lineage.kind === 'fork', size: -1 }, brief })
+    }
+  }
+  if (found.length === 0) return
+  await update($, timeline, tl => ({
+    ...tl,
+    sessions: [...(tl.sessions ?? []), ...found.map(f => f.session).filter(s => !tl.sessions?.some(k => k.id === s.id))],
+    briefs: (tl.briefs ?? []).map(b => {
+      const match = found.find(f => f.brief && briefKey(f.brief) === briefKey(b) && f.brief.at === b.at)
+      return match && !b.matched ? { ...b, matched: match.session.id } : b
+    }),
+  }))
+}
+
+/** Re-reads each linked side session whose transcript has grown into its row. */
+async function poll($: EngineInterface) {
+  const { sessions = [], briefs = [] } = await read($, timeline)
+  for (const session of sessions) {
+    const stat = await $.fs.stat(session.path).catch(() => undefined)
+    if (!stat || stat.size === session.size) continue
+    const text = await readTail($, session.path, stat.size)
+    if (text === undefined) continue
+    const brief = briefs.find(b => b.matched === session.id)
+    const base = {
+      id: `${SIDE}${session.id}`,
+      description: brief?.title ?? `Session ${session.id.slice(0, 8)}`,
+      type: session.isFork ? 'side session (fork)' : 'side session',
+      parentId: MAIN,
+    }
+    const parsed = parseTranscript(text, base, { sessionId: session.id, isSession: true })
+    if (!parsed) continue
+    const agent: Agent = {
+      ...parsed.agent,
+      description: parsed.title ?? base.description,
+      note: stat.size > TAIL ? `Read from the last ${megabytes(TAIL)} of a ${megabytes(stat.size)} transcript.` : undefined,
+    }
+    await update($, timeline, tl => {
+      const index = tl.agents.findIndex(a => a.id === agent.id)
+      const old = tl.agents[index]
+      // The transcript is the row's whole truth, but a tail read keeps the earlier bars.
+      const row = old ? { ...agent, startedAt: Math.min(old.startedAt, agent.startedAt), spans: mergeSpans([...old.spans, ...agent.spans]) } : agent
+      const agents = index < 0 ? [...tl.agents, row] : tl.agents.map((a, i) => (i === index ? row : a))
+      const hooks = [...tl.hooks, ...newHooks(tl.hooks, parsed.hooks)].sort((a, b) => a.at - b.at).slice(-KEEP_HOOKS)
+      return { ...tl, agents, hooks, sessions: (tl.sessions ?? []).map(s => (s.id === session.id ? { ...s, size: stat.size } : s)) }
+    })
+  }
+}
+
+/** One pass over side sessions: look for new ones while a brief waits, then read the linked ones. */
+async function sideSessions($: EngineInterface) {
+  if (isScanning) return
+  isScanning = true
+  try {
+    const t = await $.clock.now()
+    const pending = ((await read($, timeline)).briefs ?? []).filter(b => !b.matched && t - b.at < BRIEF_TTL)
+    scans += 1
+    if (pending.length > 0 && (pending.some(b => t - b.at < FAST_SCAN) || scans % 4 === 0)) await discover($, pending)
+    await poll($)
+  } finally {
+    isScanning = false
+  }
+}
+
+function scanSides($: EngineInterface) {
+  void sideSessions($).catch(error => $.ui.log(`agent-timeline: could not read side sessions: ${String(error)}`))
+}
+
 export const register: Register = on => {
   on('session.start', async ($, e, next) => {
     // A name another command holds is refused; the pane must still open.
@@ -485,10 +664,13 @@ export const register: Register = on => {
     await update($, now, () => started)
     $.clock.every(15_000, () => {
       void $.clock.now().then(t => update($, now, () => t))
+      scanSides($)
     })
     // Earlier agents come from the transcripts, off the session's start.
     $.clock.after(0, () => {
-      void backfill($, e.cwd).catch(error => $.ui.log(`agent-timeline: could not read earlier agents: ${String(error)}`))
+      void backfill($, e.cwd)
+        .catch(error => $.ui.log(`agent-timeline: could not read earlier agents: ${String(error)}`))
+        .then(() => scanSides($))
     })
     void $.ui.open({ id: PANE, title: TITLE })
     return next(e)
@@ -498,6 +680,8 @@ export const register: Register = on => {
     // A /clear goes on under a new session id with no session.start: start the chart afresh.
     if (e.reason === 'clear') {
       layers.clear()
+      rejected.clear()
+      scans = 0
       await update($, timeline, () => EMPTY)
       await update($, selected, () => '')
       await edit($, MAIN, await $.clock.now())
@@ -549,6 +733,14 @@ export const register: Register = on => {
       lastCleanAt: failed ? a.lastCleanAt : end,
       calls: a.calls.map(c => (c.id === call.id ? { ...c, endAt: end, isError: failed } : c)),
     }))
+    if (!failed && (e.tool === START_SESSION || e.tool === HAND_OFF)) {
+      // A side session: its transcript is matched by the brief it was handed.
+      const handed = briefOf(e.tool, e as unknown as Record<string, unknown>, t, ran.text ?? '')
+      if (handed) {
+        await addBriefs($, [handed])
+        $.clock.after(3_000, () => scanSides($))
+      }
+    }
     return ran
   })
 
@@ -630,11 +822,13 @@ export const register: Register = on => {
     // Main first, then the latest subagents active in the window; unfinished
     // ones always stay.
     const main = all.filter(a => a.id === MAIN)
-    const inWindow = all.filter(a => a.id !== MAIN && (a.endedAt === undefined || a.lastAt >= t0))
+    const inWindow = all.filter(a => a.id !== MAIN && !isSide(a) && (a.endedAt === undefined || a.lastAt >= t0))
     const unfinished = inWindow.filter(a => a.endedAt === undefined)
     const finished = inWindow.filter(a => a.endedAt !== undefined).slice(-Math.max(0, SHOWN_ROWS - 1 - unfinished.length))
     const subs = inWindow.filter(a => unfinished.includes(a) || finished.includes(a))
-    const shown = [...main, ...subs]
+    // Side sessions this one started, under the subagents.
+    const sides = all.filter(a => isSide(a) && (a.endedAt === undefined || a.lastAt >= t0)).sort((a, b) => a.startedAt - b.startedAt)
+    const shown = [...main, ...subs, ...sides]
     const hidden = all.length - shown.length
 
     const counts = new Map<Status, number>()
@@ -734,13 +928,13 @@ export const register: Register = on => {
           {agent.result && (
             <Box flexDirection="column">
               <Text dimColor bold>
-                {agent.id === MAIN ? 'LATEST REPLY' : 'RESULT'}
+                {agent.id === MAIN || isSide(agent) ? 'LATEST REPLY' : 'RESULT'}
               </Text>
               <Markdown key={`result-${agent.id}`} text={agent.result.slice(0, 1500)} />
             </Box>
           )}
 
-          {canOpenTranscript && agent.id !== MAIN && (
+          {canOpenTranscript && agent.id !== MAIN && !isSide(agent) && (
             <Box flexDirection="row">
               <Button key={`view-${agent.id}`} label="Open transcript" onPress={() => void openTranscript(agent.id)} />
             </Box>
@@ -756,6 +950,11 @@ export const register: Register = on => {
           <Text bold>
             {subs.length} agent{subs.length === 1 ? '' : 's'}
           </Text>
+          {sides.length > 0 && (
+            <Text bold>
+              {sides.length} side session{sides.length === 1 ? '' : 's'}
+            </Text>
+          )}
           {[...counts].map(([status, n]) => (
             <Text color={STATUS_THEME[status]}>
               ● {n} {status.toLowerCase()}
@@ -773,7 +972,7 @@ export const register: Register = on => {
           {shown.map(agent => {
             const status = statusOf(agent, t)
             const marks = marksOf(agent)
-            return (
+            const line = (
               <Box key={`agent-${agent.id}`} flexDirection="row" gap={1}>
                 <Box key={`label-${agent.id}`} width={labelColumns} flexDirection="row" gap={1}>
                   <Text color={STATUS_THEME[status]}>●</Text>
@@ -836,6 +1035,14 @@ export const register: Register = on => {
                 </Box>
               </Box>
             )
+            return agent === sides[0]
+              ? [
+                  <Text key="sides-head" dimColor bold>
+                    SIDE SESSIONS
+                  </Text>,
+                  line,
+                ]
+              : line
           })}
 
           <Box flexDirection="row" gap={1}>
