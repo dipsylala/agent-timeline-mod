@@ -519,6 +519,19 @@ test('side sessions this one started get rows from their transcripts', async ($,
       { type: 'custom-title', customTitle: 'Check docs', sessionId: FORK },
       { type: 'assistant', timestamp: at(6), sessionId: FORK, message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'Docs are fine.' }] } },
     ]),
+    // A desktop side chat is a fork of this session too, but started by no brief: no row.
+    [`${PROJECTS}/-work/5ide0c4a-0000-0000-0000-000000000000.jsonl`]: lines([
+      { type: 'user', timestamp: at(-100), sessionId: OWN, message: { content: 'Hi' } },
+      { type: 'custom-title', customTitle: 'Side chat', sessionId: '5ide0c4a-0000-0000-0000-000000000000' },
+      { type: 'user', timestamp: at(3), sessionId: '5ide0c4a-0000-0000-0000-000000000000', message: { content: 'Quick question' } },
+    ]),
+    // A hand-off: its result names no id, so the fork is matched by the title it records.
+    [`${PROJECTS}/-work/4a4d0ff0-0000-0000-0000-000000000000.jsonl`]: lines([
+      { type: 'user', timestamp: at(-100), sessionId: OWN, message: { content: 'Hi' } },
+      { type: 'custom-title', customTitle: 'Parent title', sessionId: '4a4d0ff0-0000-0000-0000-000000000000' },
+      { type: 'user', timestamp: at(4), sessionId: '4a4d0ff0-0000-0000-0000-000000000000', message: { content: 'Carry on with the plan.' } },
+      { type: 'custom-title', customTitle: 'Finish the plan', sessionId: '4a4d0ff0-0000-0000-0000-000000000000' },
+    ]),
     // Someone else's session, changed meanwhile: no row.
     [`${PROJECTS}/-other/0000aaaa-0000-0000-0000-000000000000.jsonl`]: lines([
       { type: 'user', timestamp: at(2), sessionId: '0000aaaa-0000-0000-0000-000000000000', message: { content: 'Unrelated work' } },
@@ -565,10 +578,15 @@ test('side sessions this one started get rows from their transcripts', async ($,
     $.tool.call({ tool: 'mcp__ccd_session__start_session', initiation: 'user_asked', tool_use_id: id, ...input } as never)
   await start({ title: 'Rename widget', context: 'fresh', prompt: BRIEF, background: 'Context.' }, 'toolu_s1')
   await start({ title: 'Check docs', context: 'fork', prompt: 'Check the docs.' }, 'toolu_s2')
+  await $.tool.call({ tool: 'mcp__ccd_session__hand_off_to_session', title: 'Finish the plan', remaining_plan: 'Carry on with the plan.', tool_use_id: 'toolu_s3' } as never)
   await clock.advance(3_000)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await ui.find({ type: 'Text', text: /^2 side sessions/ }), 'summary').toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^3 side sessions/ }), 'summary').toBeDefined()
+  // With no subagents, the summary leaves out "0 agents".
+  expect(await ui.find({ type: 'Text', text: /^0 agents/ }), 'no agent count').toBeUndefined()
+  expect((await ui.find({ key: 'session:4a4d0ff0-0000-0000-0000-000000000000' }))?.text, 'hand-off').toBe('Finish the plan')
+  expect(await ui.find({ key: 'session:5ide0c4a-0000-0000-0000-000000000000' }), 'side chat').toBeUndefined()
   expect(await ui.find({ type: 'Text', text: 'SIDE SESSIONS' }), 'heading').toBeDefined()
   expect((await ui.find({ key: `session:${FRESH}` }))?.text).toBe('Rename widget')
   expect((await ui.find({ key: `session:${FORK}` }))?.text).toBe('Check docs')
@@ -601,6 +619,12 @@ test("a transcript's start says whether it is a side session of this one", () =>
   // A fork of this session, and a fork of it when it is itself a fork of g.
   expect(lineageOf(head(prompt('me', 'Hi'), prompt('kid', 'Go')), 'kid', 'me').kind).toBe('fork')
   expect(lineageOf(head(prompt('g', 'Old'), prompt('me', 'Hi'), prompt('kid', 'Go')), 'kid', 'me').kind).toBe('fork')
+  // A fork's title is the latest it records as its own, after the one copied from its parent.
+  const titled = (sessionId: string, customTitle: string) => ({ type: 'custom-title', sessionId, customTitle })
+  expect(lineageOf(head(prompt('me', 'Hi'), titled('kid', 'Parent'), prompt('kid', 'Go'), titled('kid', 'Mine')), 'kid', 'me')).toEqual({
+    kind: 'fork',
+    title: 'Mine',
+  })
   // Someone else's fork, and someone else's session.
   expect(lineageOf(head(prompt('g', 'Old'), prompt('kid', 'Go')), 'kid', 'me').kind).toBe('other')
   expect(lineageOf(head(prompt('g', 'Old')), 'kid', 'me').kind).toBe('other')
