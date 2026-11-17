@@ -518,7 +518,22 @@ test('side sessions this one started get rows from their transcripts', async ($,
       { type: 'user', timestamp: at(3), sessionId: FORK, turnOrigin: 'host_synthetic', message: { content: 'You are a fork. Check the docs.' } },
       { type: 'custom-title', customTitle: 'Check docs', sessionId: FORK },
       { type: 'assistant', timestamp: at(6), sessionId: FORK, message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'Docs are fine.' }] } },
+      // A background task's notice, written after its turn ended and not answered: still idle.
+      { type: 'user', timestamp: at(7), sessionId: FORK, message: { content: '<task-notification>done</task-notification>' } },
     ]),
+    // The fresh session's subagents, kept beside its transcript as this session's are.
+    [`${PROJECTS}/-work--claude-worktrees-x/${FRESH}/subagents/agent-sub1.jsonl`]: lines([
+      { type: 'user', timestamp: at(5), message: { content: 'List the hooks folder' } },
+      { type: 'assistant', timestamp: at(6), message: { content: [{ type: 'tool_use', id: 'toolu_g1', name: 'Glob', input: { pattern: 'hooks/*' } }] } },
+      { type: 'user', timestamp: at(7), message: { content: [{ type: 'tool_result', tool_use_id: 'toolu_g1', content: 'register.tsx' }] } },
+      { type: 'assistant', timestamp: at(8), message: { content: [{ type: 'text', text: 'Two files.' }] } },
+    ]),
+    [`${PROJECTS}/-work--claude-worktrees-x/${FRESH}/subagents/agent-sub1.meta.json`]: JSON.stringify({ description: 'List hooks', agentType: 'Explore', finished: true }),
+    [`${PROJECTS}/-work--claude-worktrees-x/${FRESH}/subagents/agent-sub2.jsonl`]: lines([
+      { type: 'user', timestamp: at(5), message: { content: 'Run a slow command' } },
+      { type: 'assistant', timestamp: at(6), message: { content: [{ type: 'tool_use', id: 'toolu_s9', name: 'Bash', input: { command: 'sleep 20' } }] } },
+    ]),
+    [`${PROJECTS}/-work--claude-worktrees-x/${FRESH}/subagents/agent-sub2.meta.json`]: JSON.stringify({ description: 'Slow command', agentType: 'general-purpose' }),
     // A desktop side chat is a fork of this session too, but started by no brief: no row.
     [`${PROJECTS}/-work/5ide0c4a-0000-0000-0000-000000000000.jsonl`]: lines([
       { type: 'user', timestamp: at(-100), sessionId: OWN, message: { content: 'Hi' } },
@@ -587,6 +602,17 @@ test('side sessions this one started get rows from their transcripts', async ($,
   expect(await ui.find({ type: 'Text', text: /^0 agents/ }), 'no agent count').toBeUndefined()
   expect((await ui.find({ key: 'session:4a4d0ff0-0000-0000-0000-000000000000' }))?.text, 'hand-off').toBe('Finish the plan')
   expect(await ui.find({ key: 'session:5ide0c4a-0000-0000-0000-000000000000' }), 'side chat').toBeUndefined()
+
+  // The fresh session's subagents get rows under its own, and stay out of the agent count.
+  expect((await ui.find({ key: `session-agent:${FRESH}/sub1` }))?.text).toBe('List hooks')
+  expect((await ui.find({ key: `session-agent:${FRESH}/sub2` }))?.text).toBe('Slow command')
+  expect(await ui.find({ type: 'Text', text: /agents?$/ }), 'agent count').toBeUndefined()
+  await ui.press({ key: `session-agent:${FRESH}/sub1` })
+  expect(await ui.find({ type: 'Text', text: /^List hooks · Done · Explore · .* · 1 call$/ }), 'finished subagent').toBeDefined()
+  expect(await ui.find({ type: 'Markdown', text: /Two files\./ }), 'subagent result').toBeDefined()
+  await ui.press({ key: `session-agent:${FRESH}/sub2` })
+  expect(await ui.find({ type: 'Text', text: /^Slow command · Running · general-purpose · / }), 'running subagent').toBeDefined()
+  await ui.press({ key: `session-agent:${FRESH}/sub2` })
   expect(await ui.find({ type: 'Text', text: 'SIDE SESSIONS' }), 'heading').toBeDefined()
   expect((await ui.find({ key: `session:${FRESH}` }))?.text).toBe('Rename widget')
   expect((await ui.find({ key: `session:${FORK}` }))?.text).toBe('Check docs')
